@@ -213,7 +213,7 @@ fn constant_time_eq_16(a: &[u8; 16], b: &[u8]) -> bool {
     for i in 0..16 {
         diff |= a[i] ^ b[i];
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]

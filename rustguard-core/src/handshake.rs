@@ -222,18 +222,31 @@ pub fn process_initiation(
     our_static: &StaticSecret,
     msg: &Initiation,
     responder_index: u32,
-) -> Option<(PublicKey, Response, TransportSession)> {
-    process_initiation_psk(our_static, msg, responder_index, &[0u8; 32])
+) -> Option<(PublicKey, Tai64n, Response, TransportSession)> {
+    process_initiation_psk(our_static, msg, responder_index, &[0u8; 32], None)
 }
 
 /// Process a handshake initiation with an optional pre-shared key.
+///
+/// `last_timestamp`: if Some, the timestamp in the initiation must be strictly
+/// newer than this value. Pass None to skip replay check (first handshake).
 pub fn process_initiation_psk(
     our_static: &StaticSecret,
     msg: &Initiation,
     responder_index: u32,
     psk: &[u8; 32],
-) -> Option<(PublicKey, Response, TransportSession)> {
+    last_timestamp: Option<&Tai64n>,
+) -> Option<(PublicKey, Tai64n, Response, TransportSession)> {
     let our_public = our_static.public_key();
+
+    // ── Verify MAC1 FIRST — cheap check before any DH. ──
+    let wire = msg.to_bytes();
+    let expected_mac1 = compute_mac1(&our_public, &wire[..116]);
+    if !constant_time_eq(&msg.mac1, &expected_mac1) {
+        return None;
+    }
+    // TODO: MAC2 / cookie validation under load.
+
     let mut ck = initial_chain_key();
     let mut h = initial_hash(&ck);
 
@@ -267,17 +280,18 @@ pub fn process_initiation_psk(
     (ck, key2) = mix_key(&ck, &dh2);
 
     // Decrypt timestamp.
-    let (new_h, _timestamp_bytes) = decrypt_and_hash(&key2, &h, &msg.encrypted_timestamp)?;
+    let (new_h, timestamp_bytes) = decrypt_and_hash(&key2, &h, &msg.encrypted_timestamp)?;
     h = new_h;
-    // TODO: validate timestamp is newer than last seen for this peer.
 
-    // Verify MAC1.
-    let wire = msg.to_bytes();
-    let expected_mac1 = compute_mac1(&our_public, &wire[..116]);
-    if !constant_time_eq(&msg.mac1, &expected_mac1) {
-        return None;
+    // Validate timestamp is newer than last seen — prevents replay.
+    let timestamp = Tai64n::from_bytes(
+        timestamp_bytes.as_slice().try_into().ok()?,
+    );
+    if let Some(last) = last_timestamp {
+        if !timestamp.is_after(last) {
+            return None; // Replayed or stale initiation.
+        }
     }
-    // TODO: MAC2 / cookie validation under load.
 
     // ── Build response ──
 
@@ -323,17 +337,17 @@ pub fn process_initiation_psk(
 
     let session = TransportSession::new(responder_index, msg.sender_index, send_key, recv_key);
 
-    Some((initiator_public, resp, session))
+    Some((initiator_public, timestamp, resp, session))
 }
 
-/// Constant-time comparison for MACs. Not using subtle crate to keep deps minimal,
-/// but this is the standard fold-OR approach.
+/// Constant-time comparison for MACs.
+/// Uses black_box to prevent LLVM from optimizing into an early-return.
 fn constant_time_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
     let mut diff = 0u8;
     for i in 0..16 {
         diff |= a[i] ^ b[i];
     }
-    diff == 0
+    std::hint::black_box(diff) == 0
 }
 
 #[cfg(test)]
@@ -352,7 +366,7 @@ mod tests {
             create_initiation(&initiator_static, &responder_public, 1);
 
         // Step 2: Responder processes initiation, creates response.
-        let (peer_pubkey, resp_msg, mut resp_session) =
+        let (peer_pubkey, _ts, resp_msg, mut resp_session) =
             process_initiation(&responder_static, &init_msg, 2)
                 .expect("responder should accept initiation");
 
@@ -419,7 +433,7 @@ mod tests {
         let (init_msg, init_state) =
             create_initiation(&initiator_static, &responder_public, 1);
 
-        let (_, mut resp_msg, _) =
+        let (_, _ts, mut resp_msg, _) =
             process_initiation(&responder_static, &init_msg, 2).unwrap();
 
         // Tamper with the encrypted empty field.
@@ -438,7 +452,7 @@ mod tests {
         let (init_msg, init_state) =
             create_initiation(&initiator_static, &responder_public, 1);
 
-        let (_, mut resp_msg, _) =
+        let (_, _ts, mut resp_msg, _) =
             process_initiation(&responder_static, &init_msg, 2).unwrap();
 
         // Change receiver_index to wrong value.

@@ -3,6 +3,8 @@ use blake2::digest::CtOutput;
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use blake2::digest::Mac;
 
+const BLAKE2S_BLOCK_SIZE: usize = 64;
+
 /// BLAKE2s-256 hash.
 pub fn hash(data: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Blake2s256::new();
@@ -13,9 +15,12 @@ pub fn hash(data: &[&[u8]]) -> [u8; 32] {
 }
 
 /// BLAKE2s-256 keyed MAC (used for MAC1/MAC2 in WireGuard).
+///
+/// This uses BLAKE2s's built-in keying mode, NOT HMAC.
+/// WireGuard uses this for MAC1/MAC2, but uses HMAC for the KDF.
 pub fn mac(key: &[u8], data: &[&[u8]]) -> [u8; 32] {
     let mut m = Blake2sMac::<U32>::new_from_slice(key)
-        .expect("BLAKE2s accepts any key length up to 32 bytes");
+        .expect("BLAKE2s-MAC key must be <= 32 bytes");
     for chunk in data {
         m.update(chunk);
     }
@@ -51,10 +56,35 @@ pub fn hkdf(key: &[u8; 32], input: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
     (t1, t2, t3)
 }
 
-/// HMAC-BLAKE2s as used in WireGuard's KDF.
-/// HMAC(key, msg) = BLAKE2s(key, msg) using BLAKE2s's built-in keying.
+/// Real HMAC-BLAKE2s: H((K ^ opad) || H((K ^ ipad) || msg))
+///
+/// This is the standard HMAC construction per RFC 2104, using BLAKE2s
+/// as the hash function. WireGuard's KDF requires this — NOT the
+/// built-in keyed BLAKE2s mode.
 fn hmac_blake2s(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    mac(key, &[data])
+    // Pad key to block size (64 bytes for BLAKE2s).
+    let mut padded_key = [0u8; BLAKE2S_BLOCK_SIZE];
+    padded_key[..32].copy_from_slice(key);
+
+    // Inner: H((K ^ ipad) || data)
+    let mut ipad = [0x36u8; BLAKE2S_BLOCK_SIZE];
+    for i in 0..BLAKE2S_BLOCK_SIZE {
+        ipad[i] ^= padded_key[i];
+    }
+    let mut inner = Blake2s256::new();
+    inner.update(&ipad);
+    inner.update(data);
+    let inner_hash: [u8; 32] = inner.finalize().into();
+
+    // Outer: H((K ^ opad) || inner_hash)
+    let mut opad = [0x5cu8; BLAKE2S_BLOCK_SIZE];
+    for i in 0..BLAKE2S_BLOCK_SIZE {
+        opad[i] ^= padded_key[i];
+    }
+    let mut outer = Blake2s256::new();
+    outer.update(&opad);
+    outer.update(&inner_hash);
+    outer.finalize().into()
 }
 
 #[cfg(test)]
@@ -87,6 +117,31 @@ mod tests {
         let m1 = mac(&[0x01; 32], &[b"data"]);
         let m2 = mac(&[0x02; 32], &[b"data"]);
         assert_ne!(m1, m2);
+    }
+
+    #[test]
+    fn hmac_differs_from_keyed_blake2s() {
+        // HMAC-BLAKE2s and keyed BLAKE2s must produce different outputs.
+        // This is the bug we're fixing.
+        let key = [0x42u8; 32];
+        let data = b"test data";
+        let hmac_result = hmac_blake2s(&key, data);
+        let mac_result = mac(&key, &[data]);
+        assert_ne!(hmac_result, mac_result, "HMAC and keyed BLAKE2s must differ");
+    }
+
+    #[test]
+    fn hmac_test_vector() {
+        // HMAC-BLAKE2s test: verify against known behavior.
+        // HMAC(key=zeros, data=empty) should be deterministic.
+        let key = [0u8; 32];
+        let h1 = hmac_blake2s(&key, b"");
+        let h2 = hmac_blake2s(&key, b"");
+        assert_eq!(h1, h2);
+        // And different from HMAC with different key.
+        let key2 = [1u8; 32];
+        let h3 = hmac_blake2s(&key2, b"");
+        assert_ne!(h1, h3);
     }
 
     #[test]

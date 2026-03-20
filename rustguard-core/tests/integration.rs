@@ -18,7 +18,7 @@ fn do_handshake() -> (
 
     let (init_msg, init_state) = handshake::create_initiation(&init_static, &resp_public, 1);
 
-    let (peer_key, resp_msg, resp_session) =
+    let (peer_key, _ts, resp_msg, resp_session) =
         handshake::process_initiation(&resp_static, &init_msg, 2)
             .expect("responder rejects initiation");
 
@@ -104,7 +104,7 @@ fn wire_format_roundtrip() {
 
     // Now do a real handshake and test transport wire format.
     let (init_msg, init_state) = handshake::create_initiation(&init_static, &resp_public, 1);
-    let (_, resp_msg, mut resp_session) =
+    let (_, _ts, resp_msg, mut resp_session) =
         handshake::process_initiation(&resp_static, &init_msg, 2).unwrap();
 
     let resp_wire = resp_msg.to_bytes();
@@ -146,7 +146,7 @@ fn multiple_independent_handshakes() {
         let (init_msg, init_state) =
             handshake::create_initiation(&init_static, &resp_public, i + 100);
 
-        let (_, resp_msg, resp_session) =
+        let (_, _ts, resp_msg, resp_session) =
             handshake::process_initiation(&resp_static, &init_msg, i + 200)
                 .expect("handshake failed");
 

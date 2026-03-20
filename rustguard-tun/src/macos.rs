@@ -157,15 +157,26 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
             return Err(last_os_error());
         }
 
+        if name_len < 2 {
+            libc::close(fd);
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty interface name"));
+        }
+
         let name = std::str::from_utf8(&name_buf[..name_len as usize - 1])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid interface name"))?
+            .map_err(|e| { libc::close(fd); io::Error::new(io::ErrorKind::InvalidData, format!("invalid interface name: {e}")) })?
             .to_string();
 
         // 5. Configure the interface address.
-        configure_address(&name, config)?;
+        if let Err(e) = configure_address(&name, config) {
+            libc::close(fd);
+            return Err(e);
+        }
 
         // 6. Set MTU.
-        set_mtu(&name, config.mtu)?;
+        if let Err(e) = set_mtu(&name, config.mtu) {
+            libc::close(fd);
+            return Err(e);
+        }
 
         Ok(Tun { fd, name })
     }

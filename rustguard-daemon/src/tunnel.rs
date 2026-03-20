@@ -30,9 +30,12 @@ use crate::peer::Peer;
 struct TunnelState {
     our_static: StaticSecret,
     peers: Vec<Peer>,
-    /// Maps sender_index -> peer index for routing incoming handshake responses.
-    pending_handshakes: Vec<(u32, handshake::InitiatorHandshake)>,
+    /// Maps sender_index -> handshake state. Capped and pruned.
+    pending_handshakes: Vec<(u32, std::time::Instant, handshake::InitiatorHandshake)>,
 }
+
+const MAX_PENDING_HANDSHAKES: usize = 64;
+const HANDSHAKE_EXPIRY: Duration = Duration::from_secs(30);
 
 /// Routes we've added that need cleanup on shutdown.
 struct RouteEntry {
@@ -163,7 +166,7 @@ pub fn run(config: Config) -> io::Result<()> {
                     &st.peers[i].public_key,
                     sender_index,
                 );
-                st.pending_handshakes.push((sender_index, init_state));
+                st.pending_handshakes.push((sender_index, std::time::Instant::now(), init_state));
                 st.peers[i].timers.last_handshake_sent =
                     Some(std::time::Instant::now());
 
@@ -288,7 +291,7 @@ pub fn run(config: Config) -> io::Result<()> {
                     let result =
                         handshake::process_initiation(&st.our_static, &msg, responder_index);
 
-                    if let Some((peer_pubkey, resp_msg, session)) = result {
+                    if let Some((peer_pubkey, _timestamp, resp_msg, session)) = result {
                         if let Some(peer) = st
                             .peers
                             .iter_mut()
@@ -318,10 +321,10 @@ pub fn run(config: Config) -> io::Result<()> {
                     let pos = st
                         .pending_handshakes
                         .iter()
-                        .position(|(idx, _)| *idx == msg.receiver_index);
+                        .position(|(idx, _, _)| *idx == msg.receiver_index);
 
                     if let Some(pos) = pos {
-                        let (sender_index, init_state) = st.pending_handshakes.remove(pos);
+                        let (sender_index, _, init_state) = st.pending_handshakes.remove(pos);
                         let result = handshake::process_response(
                             init_state,
                             &st.our_static,
@@ -331,8 +334,7 @@ pub fn run(config: Config) -> io::Result<()> {
                         if let Some(session) = result {
                             // Find peer that initiated with this sender_index.
                             if let Some(peer) = st.peers.iter_mut().find(|p| {
-                                p.endpoint.is_some()
-                                    && !p.has_active_session()
+                                (p.endpoint.is_some() && !p.has_active_session())
                                     || p.session
                                         .as_ref()
                                         .is_some_and(|s| s.our_index == sender_index)
@@ -394,6 +396,9 @@ pub fn run(config: Config) -> io::Result<()> {
 
             let mut st = state_timer.lock().unwrap();
 
+            // Prune stale pending handshakes.
+            st.pending_handshakes.retain(|(_, created, _)| created.elapsed() < HANDSHAKE_EXPIRY);
+
             // Collect handshake retry requests (avoids borrow conflict).
             let mut rekey_requests: Vec<(usize, SocketAddr)> = Vec::new();
 
@@ -443,7 +448,11 @@ pub fn run(config: Config) -> io::Result<()> {
                     &st.peers[idx].public_key,
                     sender_index,
                 );
-                st.pending_handshakes.push((sender_index, init_state));
+                // Cap pending handshakes to prevent memory exhaustion.
+                if st.pending_handshakes.len() >= MAX_PENDING_HANDSHAKES {
+                    st.pending_handshakes.remove(0); // Drop oldest.
+                }
+                st.pending_handshakes.push((sender_index, std::time::Instant::now(), init_state));
                 st.peers[idx].timers.last_handshake_sent =
                     Some(std::time::Instant::now());
 

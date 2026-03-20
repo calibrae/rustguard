@@ -45,7 +45,7 @@ struct IfreqAddr {
 struct IfreqMtu {
     ifr_name: [u8; IFNAMSIZ],
     ifr_mtu: libc::c_int,
-    _pad: [u8; 12],
+    _pad: [u8; 20], // ifreq union is 24 bytes, c_int is 4
 }
 
 fn last_os_error() -> io::Error {
@@ -103,11 +103,14 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
             .position(|&b| b == 0)
             .unwrap_or(IFNAMSIZ);
         let name = std::str::from_utf8(&ifr.ifr_name[..name_end])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid interface name"))?
+            .map_err(|e| { libc::close(fd); io::Error::new(io::ErrorKind::InvalidData, format!("invalid interface name: {e}")) })?
             .to_string();
 
         // 3. Configure addresses and MTU via a separate socket.
-        configure_interface(&name, config)?;
+        if let Err(e) = configure_interface(&name, config) {
+            libc::close(fd);
+            return Err(e);
+        }
 
         Ok(Tun { fd, name })
     }
@@ -153,7 +156,7 @@ fn configure_interface(ifname: &str, config: &TunConfig) -> io::Result<()> {
                 n
             },
             ifr_mtu: config.mtu as libc::c_int,
-            _pad: [0; 12],
+            _pad: [0; 20],
         };
         if libc::ioctl(sock, SIOCSIFMTU, &mtu_req as *const _) < 0 {
             libc::close(sock);

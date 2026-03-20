@@ -26,42 +26,61 @@ impl ReplayWindow {
         }
     }
 
-    /// Check if a counter is acceptable and mark it as seen.
-    /// Returns true if the packet should be accepted, false if it's a replay.
-    pub fn check_and_update(&mut self, counter: u64) -> bool {
-        // First packet is always accepted.
+    /// Check if a counter would be acceptable (without marking it).
+    /// Call `update()` only after the packet is authenticated.
+    pub fn check(&self, counter: u64) -> bool {
+        // First packet: accept any counter.
         if self.top == 0 && self.bitmap == [0; BITMAP_LEN] {
-            self.top = counter;
-            self.set_bit(0);
             return true;
         }
 
         if counter > self.top {
-            // New high — slide the window forward.
-            let shift = counter - self.top;
-            self.shift_window(shift);
-            self.top = counter;
-            self.set_bit(0);
-            return true;
+            return true; // New high is always acceptable.
         }
 
         let age = self.top - counter;
         if age >= WINDOW_SIZE {
-            // Too old — below the window floor.
-            return false;
+            return false; // Too old.
         }
 
-        // Check if already seen.
         let idx = age as usize;
         let word = idx / 64;
         let bit = idx % 64;
 
-        if self.bitmap[word] & (1u64 << bit) != 0 {
-            return false; // Replay.
+        self.bitmap[word] & (1u64 << bit) == 0
+    }
+
+    /// Mark a counter as seen. Only call after authentication succeeds.
+    pub fn update(&mut self, counter: u64) {
+        if self.top == 0 && self.bitmap == [0; BITMAP_LEN] {
+            self.top = counter;
+            self.set_bit(0);
+            return;
         }
 
-        // Mark as seen.
-        self.bitmap[word] |= 1u64 << bit;
+        if counter > self.top {
+            let shift = counter - self.top;
+            self.shift_window(shift);
+            self.top = counter;
+            self.set_bit(0);
+            return;
+        }
+
+        let age = self.top - counter;
+        if age < WINDOW_SIZE {
+            let idx = age as usize;
+            let word = idx / 64;
+            let bit = idx % 64;
+            self.bitmap[word] |= 1u64 << bit;
+        }
+    }
+
+    /// Combined check-and-update (for backward compat in tests).
+    pub fn check_and_update(&mut self, counter: u64) -> bool {
+        if !self.check(counter) {
+            return false;
+        }
+        self.update(counter);
         true
     }
 

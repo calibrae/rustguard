@@ -59,13 +59,18 @@ impl TransportSession {
 
     /// Decrypt an incoming transport packet.
     /// Checks the anti-replay window before decrypting.
+    /// Only marks the counter as seen after AEAD succeeds.
     /// Returns None if replay detected or decryption fails.
     pub fn decrypt(&mut self, counter: u64, ciphertext: &[u8]) -> Option<Vec<u8>> {
         // Check replay window first — cheap before expensive AEAD.
-        if !self.recv_window.check_and_update(counter) {
+        if !self.recv_window.check(counter) {
             return None;
         }
-        crypto::open(&self.key_recv, counter, &[], ciphertext)
+        // Attempt decryption. Only update replay window on success
+        // to prevent an attacker from poisoning the window with garbage.
+        let plaintext = crypto::open(&self.key_recv, counter, &[], ciphertext)?;
+        self.recv_window.update(counter);
+        Some(plaintext)
     }
 
     pub fn send_counter(&self) -> u64 {
