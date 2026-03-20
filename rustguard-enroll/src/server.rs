@@ -55,6 +55,8 @@ pub struct ServeConfig {
     pub state_path: Option<std::path::PathBuf>,
     /// Interface name for AF_XDP fast path. None = standard UDP socket.
     pub xdp_ifname: Option<String>,
+    /// Number of TUN queues (multi-queue TUN). 0 or 1 = single queue.
+    pub tun_queues: usize,
 }
 
 pub fn run(config: ServeConfig) -> io::Result<()> {
@@ -67,17 +69,40 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
 
     let token_key = protocol::derive_token_key(&config.token);
 
-    let tun = Arc::new(Tun::create(&TunConfig {
+    let tun_config = TunConfig {
         name: None,
         mtu: 1420,
         address: pool.server_addr,
         destination: pool.server_addr,
         netmask: rustguard_daemon::config::prefix_to_netmask(config.pool_prefix),
-    })?);
+    };
+    let num_queues = config.tun_queues.max(1);
+
+    // Multi-queue TUN on Linux, single TUN elsewhere.
+    #[cfg(target_os = "linux")]
+    let mq_tun = if num_queues > 1 {
+        Some(Arc::new(rustguard_tun::linux_mq::MultiQueueTun::create(&tun_config, num_queues)?))
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mq_tun: Option<Arc<()>> = None;
+
+    // Single-queue fallback (always created — used for inbound writes too).
+    let tun = Arc::new(Tun::create(&tun_config)?);
+
+    let actual_queues = match &mq_tun {
+        #[cfg(target_os = "linux")]
+        Some(mq) => mq.num_queues(),
+        _ => 1,
+    };
 
     println!("rustguard serve");
     println!("interface: {}", tun.name());
     println!("address: {}/{}", pool.server_addr, config.pool_prefix);
+    if actual_queues > 1 {
+        println!("TUN queues: {actual_queues}");
+    }
     println!("listening on 0.0.0.0:{}", config.listen_port);
     println!(
         "pool: {}/{} ({} addresses available)",
@@ -162,55 +187,79 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
 
-    // ── Outbound: TUN -> encrypt -> UDP ──
-    // Hot path: read-lock peers, find by IP, per-peer lock for encrypt, send unlocked.
-    let tun_out = Arc::clone(&tun);
-    let udp_out = Arc::clone(&udp);
-    let state_out = Arc::clone(&state);
-    let running_out = Arc::clone(&running);
-    let outbound = thread::spawn(move || {
-        let mut pkt_buf = [0u8; 1500];
-        let mut ct_buf = [0u8; 1500 + AEAD_TAG_LEN + TRANSPORT_HEADER_SIZE];
-        while running_out.load(Ordering::Relaxed) {
-            let n = match tun_out.read(&mut pkt_buf) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if n < 20 {
-                continue;
+    // ── Outbound workers: TUN -> encrypt -> UDP ──
+    // One worker per TUN queue. Each reads from its own queue, encrypts, sends UDP.
+    let mut outbound_threads = Vec::new();
+    for queue_id in 0..actual_queues {
+        let state_out = Arc::clone(&state);
+        let udp_out = Arc::clone(&udp);
+        let running_out = Arc::clone(&running);
+
+        #[cfg(target_os = "linux")]
+        let mq_clone = mq_tun.clone();
+        let tun_clone = Arc::clone(&tun);
+
+        outbound_threads.push(thread::spawn(move || {
+            let mut pkt_buf = [0u8; 1500];
+            let mut ct_buf = [0u8; 1500 + AEAD_TAG_LEN + TRANSPORT_HEADER_SIZE];
+            while running_out.load(Ordering::Relaxed) {
+                // Read from multi-queue TUN if available, else single TUN.
+                let n;
+                #[cfg(target_os = "linux")]
+                {
+                    n = if let Some(ref mq) = mq_clone {
+                        match mq.read_queue(queue_id, &mut pkt_buf) {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        match tun_clone.read(&mut pkt_buf) {
+                            Ok(n) => n,
+                            Err(_) => continue,
+                        }
+                    };
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    n = match tun_clone.read(&mut pkt_buf) {
+                        Ok(nn) => nn,
+                        Err(_) => continue,
+                    };
+                }
+
+                if n < 20 {
+                    continue;
+                }
+
+                let dst_ip = Ipv4Addr::new(pkt_buf[16], pkt_buf[17], pkt_buf[18], pkt_buf[19]);
+
+                let peers = state_out.peers.read().unwrap();
+                let peer = peers.iter().find(|p| p.assigned_ip == dst_ip);
+                let Some(peer) = peer else { continue };
+                let peer = Arc::clone(peer);
+                drop(peers);
+
+                let mut ps = peer.state.lock().unwrap();
+                let (endpoint, their_index) = match (&ps.endpoint, &ps.session) {
+                    (Some(ep), Some(s)) => (*ep, s.their_index),
+                    _ => continue,
+                };
+
+                let session = ps.session.as_mut().unwrap();
+                let Some((counter, ct_len)) = session.encrypt_to(&pkt_buf[..n], &mut ct_buf[TRANSPORT_HEADER_SIZE..]) else {
+                    continue;
+                };
+                drop(ps);
+
+                ct_buf[0..4].copy_from_slice(&MSG_TRANSPORT.to_le_bytes());
+                ct_buf[4..8].copy_from_slice(&their_index.to_le_bytes());
+                ct_buf[8..16].copy_from_slice(&counter.to_le_bytes());
+                let total = TRANSPORT_HEADER_SIZE + ct_len;
+
+                let _ = udp_out.send_to(&ct_buf[..total], endpoint);
             }
-
-            let dst_ip = Ipv4Addr::new(pkt_buf[16], pkt_buf[17], pkt_buf[18], pkt_buf[19]);
-
-            // Read-lock: find peer by IP. No contention with other readers.
-            let peers = state_out.peers.read().unwrap();
-            let peer = peers.iter().find(|p| p.assigned_ip == dst_ip);
-            let Some(peer) = peer else { continue };
-            let peer = Arc::clone(peer);
-            drop(peers); // Release read lock immediately.
-
-            // Per-peer lock: encrypt. Other peers aren't blocked.
-            let mut ps = peer.state.lock().unwrap();
-            let (endpoint, their_index) = match (&ps.endpoint, &ps.session) {
-                (Some(ep), Some(s)) => (*ep, s.their_index),
-                _ => continue,
-            };
-
-            let session = ps.session.as_mut().unwrap();
-            let Some((counter, ct_len)) = session.encrypt_to(&pkt_buf[..n], &mut ct_buf[TRANSPORT_HEADER_SIZE..]) else {
-                continue;
-            };
-            drop(ps); // Release peer lock before syscall.
-
-            // Build transport header directly into buffer.
-            ct_buf[0..4].copy_from_slice(&MSG_TRANSPORT.to_le_bytes());
-            ct_buf[4..8].copy_from_slice(&their_index.to_le_bytes());
-            ct_buf[8..16].copy_from_slice(&counter.to_le_bytes());
-            let total = TRANSPORT_HEADER_SIZE + ct_len;
-
-            let _ = udp_out.send_to(&ct_buf[..total], endpoint);
-        }
-    });
+        }));
+    }
 
     // ── Inbound: UDP/XDP -> decrypt -> TUN  (+ enrollment + handshake) ──
     let tun_in = Arc::clone(&tun);
@@ -378,7 +427,9 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
         }
     });
 
-    outbound.join().unwrap();
+    for t in outbound_threads {
+        t.join().unwrap();
+    }
     inbound.join().unwrap();
     control::cleanup(&sock_path);
 

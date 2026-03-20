@@ -7,6 +7,9 @@ mod macos;
 mod linux;
 
 #[cfg(target_os = "linux")]
+pub mod linux_mq;
+
+#[cfg(target_os = "linux")]
 pub mod xdp;
 
 #[cfg(target_os = "linux")]
