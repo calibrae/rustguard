@@ -12,6 +12,7 @@ use rustguard_crypto::{
     self as crypto, EphemeralSecret, PublicKey, SharedSecret, StaticSecret, Tai64n,
     CONSTRUCTION, IDENTIFIER, LABEL_MAC1,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::messages::{Initiation, Response};
 use crate::session::TransportSession;
@@ -65,12 +66,15 @@ pub fn compute_mac1(responder_public: &PublicKey, msg_bytes: &[u8]) -> [u8; 16] 
 // ── Initiator side ──────────────────────────────────────────────────
 
 /// State held by the initiator between sending msg1 and receiving msg2.
-#[allow(dead_code)]
+/// Zeroized on drop to prevent key material from lingering in memory.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct InitiatorHandshake {
     ck: [u8; 32],
     h: [u8; 32],
     ephemeral: EphemeralSecret,
+    #[zeroize(skip)]
     sender_index: u32,
+    #[zeroize(skip)]
     their_public: PublicKey,
     psk: [u8; 32],
 }
@@ -164,14 +168,11 @@ pub fn process_response(
     our_static: &StaticSecret,
     msg: &Response,
 ) -> Option<TransportSession> {
-    let InitiatorHandshake {
-        mut ck,
-        mut h,
-        ephemeral,
-        sender_index,
-        psk,
-        ..
-    } = state;
+    // Access fields by reference — struct will zeroize on drop.
+    let mut ck = state.ck;
+    let mut h = state.h;
+    let sender_index = state.sender_index;
+    let psk = state.psk;
 
     // Verify receiver_index matches our sender_index.
     if msg.receiver_index != sender_index {
@@ -184,7 +185,7 @@ pub fn process_response(
     h = mix_hash(&h, resp_eph.as_ref());
 
     // DH(our_ephemeral, responder_ephemeral)
-    let dh1 = ephemeral.diffie_hellman(&resp_eph);
+    let dh1 = state.ephemeral.diffie_hellman(&resp_eph);
     (ck, _) = mix_key(&ck, &dh1);
 
     // DH(our_static, responder_ephemeral)
@@ -340,14 +341,10 @@ pub fn process_initiation_psk(
     Some((initiator_public, timestamp, resp, session))
 }
 
-/// Constant-time comparison for MACs.
-/// Uses black_box to prevent LLVM from optimizing into an early-return.
+/// Constant-time comparison for MACs using the `subtle` crate.
 fn constant_time_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
-    let mut diff = 0u8;
-    for i in 0..16 {
-        diff |= a[i] ^ b[i];
-    }
-    std::hint::black_box(diff) == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
@@ -380,7 +377,7 @@ mod tests {
 
         // Step 4: Both sides can now exchange encrypted data.
         let plaintext = b"hello from the trenches";
-        let (counter, ciphertext) = init_session.encrypt(plaintext);
+        let (counter, ciphertext) = init_session.encrypt(plaintext).unwrap();
         let decrypted = resp_session
             .decrypt(counter, &ciphertext)
             .expect("responder should decrypt");
@@ -388,7 +385,7 @@ mod tests {
 
         // And the other direction.
         let reply = b"copy that, over";
-        let (counter, ciphertext) = resp_session.encrypt(reply);
+        let (counter, ciphertext) = resp_session.encrypt(reply).unwrap();
         let decrypted = init_session
             .decrypt(counter, &ciphertext)
             .expect("initiator should decrypt");

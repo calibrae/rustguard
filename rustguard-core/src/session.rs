@@ -46,15 +46,12 @@ impl TransportSession {
     }
 
     /// Encrypt a plaintext packet for transport.
-    /// Returns (counter, ciphertext) — caller wraps this in a Transport message.
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> (u64, Vec<u8>) {
+    /// Returns None if the nonce counter has been exhausted (rekey required).
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Option<(u64, Vec<u8>)> {
         let counter = self.send_counter;
-        self.send_counter = self
-            .send_counter
-            .checked_add(1)
-            .expect("nonce counter overflow — rekey required");
+        self.send_counter = self.send_counter.checked_add(1)?;
         let ciphertext = crypto::seal(&self.key_send, counter, &[], plaintext);
-        (counter, ciphertext)
+        Some((counter, ciphertext))
     }
 
     /// Decrypt an incoming transport packet.
@@ -96,7 +93,7 @@ mod tests {
         let (mut initiator, mut responder) = make_session_pair();
         let plaintext = b"ping from the trenches";
 
-        let (counter, ciphertext) = initiator.encrypt(plaintext);
+        let (counter, ciphertext) = initiator.encrypt(plaintext).unwrap();
         assert_eq!(ciphertext.len(), plaintext.len() + crypto::AEAD_TAG_LEN);
 
         let decrypted = responder.decrypt(counter, &ciphertext).unwrap();
@@ -107,23 +104,23 @@ mod tests {
     fn counter_increments() {
         let (mut initiator, _) = make_session_pair();
         assert_eq!(initiator.send_counter(), 0);
-        initiator.encrypt(b"one");
+        initiator.encrypt(b"one").unwrap();
         assert_eq!(initiator.send_counter(), 1);
-        initiator.encrypt(b"two");
+        initiator.encrypt(b"two").unwrap();
         assert_eq!(initiator.send_counter(), 2);
     }
 
     #[test]
     fn wrong_counter_fails() {
         let (mut initiator, mut responder) = make_session_pair();
-        let (counter, ciphertext) = initiator.encrypt(b"data");
+        let (counter, ciphertext) = initiator.encrypt(b"data").unwrap();
         assert!(responder.decrypt(counter + 1, &ciphertext).is_none());
     }
 
     #[test]
     fn replay_rejected() {
         let (mut initiator, mut responder) = make_session_pair();
-        let (counter, ciphertext) = initiator.encrypt(b"data");
+        let (counter, ciphertext) = initiator.encrypt(b"data").unwrap();
         assert!(responder.decrypt(counter, &ciphertext).is_some());
         assert!(
             responder.decrypt(counter, &ciphertext).is_none(),
@@ -135,9 +132,9 @@ mod tests {
     fn out_of_order_accepted() {
         let (mut initiator, mut responder) = make_session_pair();
 
-        let (c0, ct0) = initiator.encrypt(b"zero");
-        let (c1, ct1) = initiator.encrypt(b"one");
-        let (c2, ct2) = initiator.encrypt(b"two");
+        let (c0, ct0) = initiator.encrypt(b"zero").unwrap();
+        let (c1, ct1) = initiator.encrypt(b"one").unwrap();
+        let (c2, ct2) = initiator.encrypt(b"two").unwrap();
 
         // Deliver out of order: 2, 0, 1.
         assert_eq!(responder.decrypt(c2, &ct2).unwrap(), b"two");
@@ -149,8 +146,8 @@ mod tests {
     fn bidirectional() {
         let (mut initiator, mut responder) = make_session_pair();
 
-        let (c1, ct1) = initiator.encrypt(b"hello");
-        let (c2, ct2) = responder.encrypt(b"world");
+        let (c1, ct1) = initiator.encrypt(b"hello").unwrap();
+        let (c2, ct2) = responder.encrypt(b"world").unwrap();
 
         assert_eq!(responder.decrypt(c1, &ct1).unwrap(), b"hello");
         assert_eq!(initiator.decrypt(c2, &ct2).unwrap(), b"world");

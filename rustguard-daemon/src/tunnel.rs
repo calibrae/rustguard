@@ -240,7 +240,11 @@ pub fn run(config: Config) -> io::Result<()> {
                     // TODO: trigger rekey in background.
                 }
 
-                let (counter, ciphertext) = session.encrypt(&buf[..n]);
+                let Some((counter, ciphertext)) = session.encrypt(&buf[..n]) else {
+                    eprintln!("nonce exhausted — need rekey");
+                    peer.session = None;
+                    continue;
+                };
                 peer.timers.packet_sent();
                 let transport = Transport {
                     receiver_index: session.their_index,
@@ -416,7 +420,9 @@ pub fn run(config: Config) -> io::Result<()> {
                 if let Some(session) = &mut peer.session {
                     if peer.timers.needs_keepalive(peer.persistent_keepalive) {
                         if let Some(endpoint) = peer.endpoint {
-                            let (counter, ciphertext) = session.encrypt(&[]);
+                            let Some((counter, ciphertext)) = session.encrypt(&[]) else {
+                                continue;
+                            };
                             peer.timers.packet_sent();
                             let transport = Transport {
                                 receiver_index: session.their_index,
@@ -485,18 +491,13 @@ pub fn run(config: Config) -> io::Result<()> {
 /// Generate a random u32 sender index using OS entropy.
 fn rand_index() -> u32 {
     let mut buf = [0u8; 4];
-    getrandom(&mut buf);
+    fill_random(&mut buf);
     u32::from_le_bytes(buf)
 }
 
-/// Read random bytes from the OS.
-fn getrandom(buf: &mut [u8]) {
-    use std::fs::File;
-    use std::io::Read;
-    File::open("/dev/urandom")
-        .expect("failed to open /dev/urandom")
-        .read_exact(buf)
-        .expect("failed to read /dev/urandom");
+/// Read random bytes from the OS via the getrandom crate (cross-platform).
+fn fill_random(buf: &mut [u8]) {
+    getrandom::getrandom(buf).expect("failed to get random bytes");
 }
 
 /// Install a Ctrl-C / SIGTERM handler.

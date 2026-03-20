@@ -1,4 +1,5 @@
 use rand_core::OsRng;
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A static (long-lived) X25519 secret key. Zeroized on drop.
@@ -10,8 +11,17 @@ pub struct StaticSecret(x25519_dalek::StaticSecret);
 pub struct EphemeralSecret(x25519_dalek::StaticSecret);
 
 /// An X25519 public key. 32 bytes on the wire.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Uses constant-time comparison to prevent timing side-channels.
+#[derive(Clone, Debug)]
 pub struct PublicKey(x25519_dalek::PublicKey);
+
+impl PartialEq for PublicKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_bytes().ct_eq(other.0.as_bytes()).into()
+    }
+}
+
+impl Eq for PublicKey {}
 
 /// Result of a DH operation. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]

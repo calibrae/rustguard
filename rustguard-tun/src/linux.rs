@@ -52,6 +52,12 @@ fn last_os_error() -> io::Error {
     io::Error::last_os_error()
 }
 
+fn close_and_error(fd: i32) -> io::Error {
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    err
+}
+
 fn make_sockaddr_in(addr: Ipv4Addr) -> libc::sockaddr_in {
     libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
@@ -74,7 +80,7 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
         // 1. Open /dev/net/tun.
         let fd = libc::open(
             b"/dev/net/tun\0".as_ptr() as *const libc::c_char,
-            libc::O_RDWR,
+            libc::O_RDWR | libc::O_CLOEXEC,
         );
         if fd < 0 {
             return Err(last_os_error());
@@ -92,8 +98,7 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
         }
 
         if libc::ioctl(fd, TUNSETIFF, &mut ifr as *mut _) < 0 {
-            libc::close(fd);
-            return Err(last_os_error());
+            return Err(close_and_error(fd));
         }
 
         // Extract the assigned name.
@@ -130,22 +135,19 @@ fn configure_interface(ifname: &str, config: &TunConfig) -> io::Result<()> {
         };
         set_name(&mut req.ifr_name, ifname);
         if libc::ioctl(sock, SIOCSIFADDR, &req as *const _) < 0 {
-            libc::close(sock);
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
 
         // Set destination (peer) address.
         req.ifr_addr = make_sockaddr_in(config.destination);
         if libc::ioctl(sock, SIOCSIFDSTADDR, &req as *const _) < 0 {
-            libc::close(sock);
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
 
         // Set netmask.
         req.ifr_addr = make_sockaddr_in(config.netmask);
         if libc::ioctl(sock, SIOCSIFNETMASK, &req as *const _) < 0 {
-            libc::close(sock);
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
 
         // Set MTU.
@@ -159,8 +161,7 @@ fn configure_interface(ifname: &str, config: &TunConfig) -> io::Result<()> {
             _pad: [0; 20],
         };
         if libc::ioctl(sock, SIOCSIFMTU, &mtu_req as *const _) < 0 {
-            libc::close(sock);
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
 
         // Bring the interface up.
@@ -173,15 +174,13 @@ fn configure_interface(ifname: &str, config: &TunConfig) -> io::Result<()> {
 
         // Get current flags.
         if libc::ioctl(sock, SIOCGIFFLAGS, &mut flags_req as *mut _) < 0 {
-            libc::close(sock);
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
 
         // Set IFF_UP.
         flags_req.ifr_flags |= IFF_UP;
         if libc::ioctl(sock, SIOCSIFFLAGS, &flags_req as *const _) < 0 {
-            libc::close(sock);
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
 
         libc::close(sock);

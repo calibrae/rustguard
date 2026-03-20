@@ -37,14 +37,14 @@ fn full_handshake_transport_roundtrip() {
     // Send 100 packets each direction.
     for i in 0u32..100 {
         let payload = format!("init->resp packet {i}");
-        let (ctr, ct) = init.encrypt(payload.as_bytes());
+        let (ctr, ct) = init.encrypt(payload.as_bytes()).unwrap();
         let pt = resp.decrypt(ctr, &ct).unwrap();
         assert_eq!(pt, payload.as_bytes());
     }
 
     for i in 0u32..100 {
         let payload = format!("resp->init packet {i}");
-        let (ctr, ct) = resp.encrypt(payload.as_bytes());
+        let (ctr, ct) = resp.encrypt(payload.as_bytes()).unwrap();
         let pt = init.decrypt(ctr, &ct).unwrap();
         assert_eq!(pt, payload.as_bytes());
     }
@@ -54,7 +54,7 @@ fn full_handshake_transport_roundtrip() {
 fn replay_attack_blocked() {
     let (mut init, mut resp) = do_handshake();
 
-    let (ctr, ct) = init.encrypt(b"first");
+    let (ctr, ct) = init.encrypt(b"first").unwrap();
     assert!(resp.decrypt(ctr, &ct).is_some());
 
     // Replay the same packet — must be rejected.
@@ -72,7 +72,7 @@ fn out_of_order_delivery() {
     let packets: Vec<(u64, Vec<u8>, Vec<u8>)> = (0..10)
         .map(|i| {
             let payload = format!("packet {i}");
-            let (ctr, ct) = init.encrypt(payload.as_bytes());
+            let (ctr, ct) = init.encrypt(payload.as_bytes()).unwrap();
             (ctr, ct, payload.into_bytes())
         })
         .collect();
@@ -116,7 +116,7 @@ fn wire_format_roundtrip() {
         handshake::process_response(init_state, &init_static, &resp_msg).unwrap();
 
     // Transport message.
-    let (ctr, ct) = init_session.encrypt(b"test payload");
+    let (ctr, ct) = init_session.encrypt(b"test payload").unwrap();
     let transport = Transport {
         receiver_index: init_session.their_index,
         counter: ctr,
@@ -160,7 +160,7 @@ fn multiple_independent_handshakes() {
     // Each pair can communicate independently.
     for (i, (init, resp)) in sessions.iter_mut().enumerate() {
         let msg = format!("hello from peer {i}");
-        let (ctr, ct) = init.encrypt(msg.as_bytes());
+        let (ctr, ct) = init.encrypt(msg.as_bytes()).unwrap();
         let pt = resp.decrypt(ctr, &ct).unwrap();
         assert_eq!(String::from_utf8(pt).unwrap(), msg);
     }
@@ -170,7 +170,7 @@ fn multiple_independent_handshakes() {
 fn tampered_transport_rejected() {
     let (mut init, mut resp) = do_handshake();
 
-    let (ctr, mut ct) = init.encrypt(b"sensitive data");
+    let (ctr, mut ct) = init.encrypt(b"sensitive data").unwrap();
 
     // Tamper with ciphertext.
     ct[0] ^= 0xff;
@@ -182,7 +182,7 @@ fn empty_transport_packet() {
     // WireGuard uses empty transport packets as keepalives.
     let (mut init, mut resp) = do_handshake();
 
-    let (ctr, ct) = init.encrypt(b"");
+    let (ctr, ct) = init.encrypt(b"").unwrap();
     let pt = resp.decrypt(ctr, &ct).unwrap();
     assert!(pt.is_empty());
 }
@@ -193,7 +193,7 @@ fn max_size_transport_packet() {
 
     // MTU 1420 minus IP/UDP headers, this is roughly the max WireGuard payload.
     let payload = vec![0xAA; 1400];
-    let (ctr, ct) = init.encrypt(&payload);
+    let (ctr, ct) = init.encrypt(&payload).unwrap();
     let pt = resp.decrypt(ctr, &ct).unwrap();
     assert_eq!(pt, payload);
 }

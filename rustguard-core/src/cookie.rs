@@ -186,34 +186,26 @@ fn encode_addr(addr: &SocketAddr) -> Vec<u8> {
 
 fn random_bytes() -> [u8; 32] {
     let mut buf = [0u8; 32];
-    read_urandom(&mut buf);
+    read_random(&mut buf);
     buf
 }
 
 fn random_nonce() -> [u8; 24] {
     let mut buf = [0u8; 24];
-    read_urandom(&mut buf);
+    read_random(&mut buf);
     buf
 }
 
-fn read_urandom(buf: &mut [u8]) {
-    use std::fs::File;
-    use std::io::Read;
-    File::open("/dev/urandom")
-        .expect("failed to open /dev/urandom")
-        .read_exact(buf)
-        .expect("failed to read /dev/urandom");
+fn read_random(buf: &mut [u8]) {
+    getrandom::getrandom(buf).expect("failed to get random bytes");
 }
 
 fn constant_time_eq_16(a: &[u8; 16], b: &[u8]) -> bool {
     if b.len() < 16 {
         return false;
     }
-    let mut diff = 0u8;
-    for i in 0..16 {
-        diff |= a[i] ^ b[i];
-    }
-    std::hint::black_box(diff) == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(&b[..16]).into()
 }
 
 #[cfg(test)]

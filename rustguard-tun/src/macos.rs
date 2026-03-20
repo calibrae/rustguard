@@ -73,6 +73,15 @@ fn last_os_error() -> io::Error {
     io::Error::last_os_error()
 }
 
+/// Capture the OS error, close the fd, then return the captured error.
+/// This avoids close() clobbering errno.
+/// Safety: fd must be a valid open file descriptor.
+fn close_and_error(fd: i32) -> io::Error {
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    err
+}
+
 fn make_sockaddr_in(addr: Ipv4Addr) -> SockaddrIn {
     SockaddrIn {
         sin_len: 16,
@@ -95,6 +104,9 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
             return Err(last_os_error());
         }
 
+        // Prevent fd leak into child processes (route commands).
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+
         // 2. Get the control ID for utun.
         let mut info = CtlInfo {
             ctl_id: 0,
@@ -104,8 +116,7 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
             .copy_from_slice(UTUN_CONTROL_NAME);
 
         if libc::ioctl(fd, CTLIOCGINFO, &mut info as *mut _) < 0 {
-            libc::close(fd);
-            return Err(last_os_error());
+            return Err(close_and_error(fd));
         }
 
         // 3. Connect to create the utun interface.
@@ -138,8 +149,7 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
             32,
         ) < 0
         {
-            libc::close(fd);
-            return Err(last_os_error());
+            return Err(close_and_error(fd));
         }
 
         // 4. Get the assigned interface name.
@@ -153,8 +163,7 @@ pub fn create(config: &TunConfig) -> io::Result<Tun> {
             &mut name_len,
         ) < 0
         {
-            libc::close(fd);
-            return Err(last_os_error());
+            return Err(close_and_error(fd));
         }
 
         if name_len < 2 {
