@@ -9,11 +9,11 @@ mod linux;
 /// A TUN device that can read and write IP packets.
 ///
 /// On macOS this is a utun interface created via the kernel control socket.
-/// On Linux this would be /dev/net/tun (not yet implemented).
+/// On Linux this is /dev/net/tun with IFF_TUN | IFF_NO_PI.
 pub struct Tun {
     /// Raw file descriptor for the TUN device.
     fd: i32,
-    /// Interface name (e.g. "utun3").
+    /// Interface name (e.g. "utun3" on macOS, "tun0" on Linux).
     name: String,
 }
 
@@ -38,7 +38,7 @@ impl Tun {
         return macos::create(config);
 
         #[cfg(target_os = "linux")]
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "Linux TUN not yet implemented"));
+        return linux::create(config);
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"));
@@ -51,24 +51,30 @@ impl Tun {
 
     /// Read an IP packet from the TUN device.
     ///
-    /// Strips the platform-specific header (4-byte AF on macOS).
+    /// Strips the platform-specific header (4-byte AF on macOS, nothing on Linux).
     /// Returns the number of bytes read into `buf`.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         #[cfg(target_os = "macos")]
         return macos::read(self.fd, buf);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        return linux::read(self.fd, buf);
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"));
     }
 
     /// Write an IP packet to the TUN device.
     ///
-    /// Prepends the platform-specific header automatically.
+    /// Prepends the platform-specific header automatically (macOS only).
     pub fn write(&self, packet: &[u8]) -> io::Result<usize> {
         #[cfg(target_os = "macos")]
         return macos::write(self.fd, packet);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        return linux::write(self.fd, packet);
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"));
     }
 }

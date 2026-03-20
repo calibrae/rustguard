@@ -1,6 +1,8 @@
 use rustguard_crypto::{self as crypto};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::replay::ReplayWindow;
+
 /// A transport session derived from a completed handshake.
 ///
 /// Each side gets a sending key and a receiving key.
@@ -21,6 +23,9 @@ pub struct TransportSession {
     /// Outgoing nonce counter.
     #[zeroize(skip)]
     send_counter: u64,
+    /// Anti-replay window for incoming packets.
+    #[zeroize(skip)]
+    recv_window: ReplayWindow,
 }
 
 impl TransportSession {
@@ -36,6 +41,7 @@ impl TransportSession {
             key_send,
             key_recv,
             send_counter: 0,
+            recv_window: ReplayWindow::new(),
         }
     }
 
@@ -52,8 +58,13 @@ impl TransportSession {
     }
 
     /// Decrypt an incoming transport packet.
-    /// Caller provides the counter from the Transport header.
-    pub fn decrypt(&self, counter: u64, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    /// Checks the anti-replay window before decrypting.
+    /// Returns None if replay detected or decryption fails.
+    pub fn decrypt(&mut self, counter: u64, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        // Check replay window first — cheap before expensive AEAD.
+        if !self.recv_window.check_and_update(counter) {
+            return None;
+        }
         crypto::open(&self.key_recv, counter, &[], ciphertext)
     }
 
@@ -77,7 +88,7 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let (mut initiator, responder) = make_session_pair();
+        let (mut initiator, mut responder) = make_session_pair();
         let plaintext = b"ping from the trenches";
 
         let (counter, ciphertext) = initiator.encrypt(plaintext);
@@ -99,9 +110,34 @@ mod tests {
 
     #[test]
     fn wrong_counter_fails() {
-        let (mut initiator, responder) = make_session_pair();
+        let (mut initiator, mut responder) = make_session_pair();
         let (counter, ciphertext) = initiator.encrypt(b"data");
         assert!(responder.decrypt(counter + 1, &ciphertext).is_none());
+    }
+
+    #[test]
+    fn replay_rejected() {
+        let (mut initiator, mut responder) = make_session_pair();
+        let (counter, ciphertext) = initiator.encrypt(b"data");
+        assert!(responder.decrypt(counter, &ciphertext).is_some());
+        assert!(
+            responder.decrypt(counter, &ciphertext).is_none(),
+            "replayed packet must be rejected"
+        );
+    }
+
+    #[test]
+    fn out_of_order_accepted() {
+        let (mut initiator, mut responder) = make_session_pair();
+
+        let (c0, ct0) = initiator.encrypt(b"zero");
+        let (c1, ct1) = initiator.encrypt(b"one");
+        let (c2, ct2) = initiator.encrypt(b"two");
+
+        // Deliver out of order: 2, 0, 1.
+        assert_eq!(responder.decrypt(c2, &ct2).unwrap(), b"two");
+        assert_eq!(responder.decrypt(c0, &ct0).unwrap(), b"zero");
+        assert_eq!(responder.decrypt(c1, &ct1).unwrap(), b"one");
     }
 
     #[test]

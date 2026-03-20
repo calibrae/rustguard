@@ -1,15 +1,18 @@
 //! The tunnel: where TUN meets UDP meets crypto.
 //!
-//! Two threads:
+//! Three threads:
 //!   1. TUN -> UDP: read IP packets from TUN, find peer by dest IP, encrypt, send UDP
 //!   2. UDP -> TUN: read UDP datagrams, handshake or decrypt, write IP packets to TUN
+//!   3. Timer: periodic checks for rekey, keepalive, dead sessions
 //!
-//! Simple. No tokio. Two threads and a prayer.
+//! Plus signal handling for clean shutdown with route cleanup.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::thread;
 
 use rustguard_core::handshake;
@@ -23,23 +26,25 @@ use rustguard_tun::{Tun, TunConfig};
 use crate::config::Config;
 use crate::peer::Peer;
 
-/// Shared state between the two tunnel threads.
+/// Shared state between the tunnel threads.
 struct TunnelState {
     our_static: StaticSecret,
     peers: Vec<Peer>,
     /// Maps sender_index -> peer index for routing incoming handshake responses.
-    pending_handshakes:
-        Vec<(u32, handshake::InitiatorHandshake)>,
+    pending_handshakes: Vec<(u32, handshake::InitiatorHandshake)>,
 }
 
-/// Start the tunnel. Blocks until error or shutdown.
+/// Routes we've added that need cleanup on shutdown.
+struct RouteEntry {
+    route: String,
+    interface: String,
+}
+
+/// Start the tunnel. Blocks until SIGINT/SIGTERM or fatal error.
 pub fn run(config: Config) -> io::Result<()> {
     let our_static = StaticSecret::from_bytes(config.interface.private_key);
-    let _our_public = our_static.public_key();
 
     // Create TUN device.
-    // For point-to-point, use the first peer's first allowed IP as destination
-    // (or a dummy). Real wg-quick would set up routes, but this gets us going.
     let dest = config
         .peers
         .first()
@@ -56,12 +61,9 @@ pub fn run(config: Config) -> io::Result<()> {
     })?);
 
     println!("interface: {}", tun.name());
-    println!(
-        "listening on 0.0.0.0:{}",
-        config.interface.listen_port
-    );
+    println!("listening on 0.0.0.0:{}", config.interface.listen_port);
 
-    // Bind UDP socket.
+    // Bind UDP socket. Set read timeout so the inbound thread can check shutdown.
     let udp = Arc::new(
         UdpSocket::bind(SocketAddr::from((
             Ipv4Addr::UNSPECIFIED,
@@ -69,6 +71,7 @@ pub fn run(config: Config) -> io::Result<()> {
         )))
         .map_err(|e| io::Error::new(e.kind(), format!("bind UDP: {e}")))?,
     );
+    udp.set_read_timeout(Some(Duration::from_millis(500)))?;
 
     // Build peer list.
     let peers: Vec<Peer> = config.peers.iter().map(Peer::from_config).collect();
@@ -78,25 +81,31 @@ pub fn run(config: Config) -> io::Result<()> {
             "peer: {} endpoint={:?} allowed_ips={:?}",
             base64_key(peer.public_key.as_bytes()),
             peer.endpoint,
-            peer.allowed_ips.iter().map(|c| format!("{}/{}", c.addr, c.prefix_len)).collect::<Vec<_>>(),
+            peer.allowed_ips
+                .iter()
+                .map(|c| format!("{}/{}", c.addr, c.prefix_len))
+                .collect::<Vec<_>>(),
         );
     }
 
     // Add routes for AllowedIPs through the TUN interface.
     let tun_name = tun.name().to_string();
+    let mut routes_added: Vec<RouteEntry> = Vec::new();
     for peer_config in &config.peers {
         for cidr in &peer_config.allowed_ips {
             let route = if cidr.prefix_len == 32 {
-                format!("{}", cidr.addr)
+                format!("{}/32", cidr.addr)
             } else {
                 format!("{}/{}", cidr.addr, cidr.prefix_len)
             };
-            let result = Command::new("route")
-                .args(["-n", "add", "-net", &route, "-interface", &tun_name])
-                .output();
+            let result = add_route(&route, &tun_name);
             match result {
                 Ok(out) if out.status.success() => {
                     println!("route add {route} -> {tun_name}");
+                    routes_added.push(RouteEntry {
+                        route,
+                        interface: tun_name.clone(),
+                    });
                 }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -105,6 +114,16 @@ pub fn run(config: Config) -> io::Result<()> {
                 Err(e) => eprintln!("route command failed: {e}"),
             }
         }
+    }
+
+    // Shutdown flag.
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let running = Arc::clone(&running);
+        ctrlc_handler(move || {
+            println!("\nshutting down...");
+            running.store(false, Ordering::SeqCst);
+        });
     }
 
     let state = Arc::new(Mutex::new(TunnelState {
@@ -118,13 +137,15 @@ pub fn run(config: Config) -> io::Result<()> {
         let mut st = state.lock().unwrap();
         for i in 0..st.peers.len() {
             if let Some(endpoint) = st.peers[i].endpoint {
-                let sender_index = (i as u32) + 1;
+                let sender_index = rand_index();
                 let (init_msg, init_state) = handshake::create_initiation(
                     &st.our_static,
                     &st.peers[i].public_key,
                     sender_index,
                 );
                 st.pending_handshakes.push((sender_index, init_state));
+                st.peers[i].timers.last_handshake_sent =
+                    Some(std::time::Instant::now());
 
                 let wire = init_msg.to_bytes();
                 if let Err(e) = udp.send_to(&wire, endpoint) {
@@ -140,40 +161,53 @@ pub fn run(config: Config) -> io::Result<()> {
     let tun_out = Arc::clone(&tun);
     let udp_out = Arc::clone(&udp);
     let state_out = Arc::clone(&state);
+    let running_out = Arc::clone(&running);
     let outbound = thread::spawn(move || {
         let mut buf = [0u8; 1500];
-        loop {
+        while running_out.load(Ordering::Relaxed) {
             let n = match tun_out.read(&mut buf) {
                 Ok(n) => n,
                 Err(e) => {
+                    if !running_out.load(Ordering::Relaxed) {
+                        break;
+                    }
                     eprintln!("TUN read error: {e}");
                     continue;
                 }
             };
 
             if n < 20 {
-                continue; // Too short for IPv4.
+                continue;
             }
 
-            // Extract destination IP from IPv4 header.
             let dst_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
-
             let mut st = state_out.lock().unwrap();
 
-            // Find peer by allowed IPs.
             let peer_idx = st.peers.iter().position(|p| p.allows_ip(dst_ip));
             let Some(idx) = peer_idx else {
-                continue; // No peer for this destination.
+                continue;
             };
 
             let peer = &mut st.peers[idx];
             let endpoint = match peer.endpoint {
                 Some(ep) => ep,
-                None => continue, // Can't send without endpoint.
+                None => continue,
             };
 
+            // Check if session is expired and needs rekey.
+            if peer.session.is_some() && !peer.has_active_session() {
+                peer.session = None; // Drop expired session.
+            }
+
             if let Some(session) = &mut peer.session {
+                // Check if we need a rekey.
+                if peer.timers.needs_rekey(session.send_counter()) {
+                    peer.timers.rekey_requested = true;
+                    // TODO: trigger rekey in background.
+                }
+
                 let (counter, ciphertext) = session.encrypt(&buf[..n]);
+                peer.timers.packet_sent();
                 let transport = Transport {
                     receiver_index: session.their_index,
                     counter,
@@ -184,7 +218,6 @@ pub fn run(config: Config) -> io::Result<()> {
                     eprintln!("UDP send error: {e}");
                 }
             }
-            // If no session yet, packet is dropped. Handshake is in progress.
         }
     });
 
@@ -192,12 +225,17 @@ pub fn run(config: Config) -> io::Result<()> {
     let tun_in = Arc::clone(&tun);
     let udp_in = Arc::clone(&udp);
     let state_in = Arc::clone(&state);
+    let running_in = Arc::clone(&running);
     let inbound = thread::spawn(move || {
         let mut buf = [0u8; 2048];
-        loop {
+        while running_in.load(Ordering::Relaxed) {
             let (n, src_addr) = match udp_in.recv_from(&mut buf) {
                 Ok(r) => r,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(e) => {
+                    if !running_in.load(Ordering::Relaxed) {
+                        break;
+                    }
                     eprintln!("UDP recv error: {e}");
                     continue;
                 }
@@ -211,20 +249,15 @@ pub fn run(config: Config) -> io::Result<()> {
 
             match msg_type {
                 MSG_INITIATION if n >= INITIATION_SIZE => {
-                    let msg = Initiation::from_bytes(
-                        buf[..INITIATION_SIZE].try_into().unwrap(),
-                    );
+                    let msg =
+                        Initiation::from_bytes(buf[..INITIATION_SIZE].try_into().unwrap());
                     let mut st = state_in.lock().unwrap();
-                    let responder_index = rand_u32();
+                    let responder_index = rand_index();
 
-                    let result = handshake::process_initiation(
-                        &st.our_static,
-                        &msg,
-                        responder_index,
-                    );
+                    let result =
+                        handshake::process_initiation(&st.our_static, &msg, responder_index);
 
                     if let Some((peer_pubkey, resp_msg, session)) = result {
-                        // Find the peer by public key.
                         if let Some(peer) = st
                             .peers
                             .iter_mut()
@@ -232,6 +265,7 @@ pub fn run(config: Config) -> io::Result<()> {
                         {
                             peer.session = Some(session);
                             peer.endpoint = Some(src_addr);
+                            peer.timers.session_started();
                             let wire = resp_msg.to_bytes();
                             if let Err(e) = udp_in.send_to(&wire, src_addr) {
                                 eprintln!("failed to send response: {e}");
@@ -246,19 +280,17 @@ pub fn run(config: Config) -> io::Result<()> {
                 }
 
                 MSG_RESPONSE if n >= RESPONSE_SIZE => {
-                    let msg = Response::from_bytes(
-                        buf[..RESPONSE_SIZE].try_into().unwrap(),
-                    );
+                    let msg =
+                        Response::from_bytes(buf[..RESPONSE_SIZE].try_into().unwrap());
                     let mut st = state_in.lock().unwrap();
 
-                    // Find the pending handshake by receiver_index.
                     let pos = st
                         .pending_handshakes
                         .iter()
                         .position(|(idx, _)| *idx == msg.receiver_index);
 
                     if let Some(pos) = pos {
-                        let (_, init_state) = st.pending_handshakes.remove(pos);
+                        let (sender_index, init_state) = st.pending_handshakes.remove(pos);
                         let result = handshake::process_response(
                             init_state,
                             &st.our_static,
@@ -266,14 +298,20 @@ pub fn run(config: Config) -> io::Result<()> {
                         );
 
                         if let Some(session) = result {
-                            // Find peer by sender_index mapping.
-                            let peer_idx = (msg.receiver_index - 1) as usize;
-                            if peer_idx < st.peers.len() {
-                                st.peers[peer_idx].session = Some(session);
-                                st.peers[peer_idx].endpoint = Some(src_addr);
+                            // Find peer that initiated with this sender_index.
+                            if let Some(peer) = st.peers.iter_mut().find(|p| {
+                                p.endpoint.is_some()
+                                    && !p.has_active_session()
+                                    || p.session
+                                        .as_ref()
+                                        .is_some_and(|s| s.our_index == sender_index)
+                            }) {
+                                peer.session = Some(session);
+                                peer.endpoint = Some(src_addr);
+                                peer.timers.session_started();
                                 println!(
                                     "handshake complete with {} (we initiated)",
-                                    base64_key(st.peers[peer_idx].public_key.as_bytes()),
+                                    base64_key(peer.public_key.as_bytes()),
                                 );
                             }
                         }
@@ -287,7 +325,6 @@ pub fn run(config: Config) -> io::Result<()> {
                     };
                     let mut st = state_in.lock().unwrap();
 
-                    // Find peer whose session has our_index matching receiver_index.
                     let peer = st.peers.iter_mut().find(|p| {
                         p.session
                             .as_ref()
@@ -295,13 +332,14 @@ pub fn run(config: Config) -> io::Result<()> {
                     });
 
                     if let Some(peer) = peer {
-                        // Update endpoint (roaming).
                         peer.endpoint = Some(src_addr);
 
-                        if let Some(session) = &peer.session {
-                            if let Some(plaintext) = session.decrypt(msg.counter, &msg.payload)
+                        if let Some(session) = &mut peer.session {
+                            if let Some(plaintext) =
+                                session.decrypt(msg.counter, &msg.payload)
                             {
-                                drop(st); // Release lock before TUN write.
+                                peer.timers.packet_received();
+                                drop(st);
                                 if let Err(e) = tun_in.write(&plaintext) {
                                     eprintln!("TUN write error: {e}");
                                 }
@@ -310,25 +348,173 @@ pub fn run(config: Config) -> io::Result<()> {
                     }
                 }
 
-                _ => {} // Unknown message type, drop.
+                _ => {}
             }
         }
     });
 
+    // Thread 3: Timer tick — keepalives, rekey, dead session cleanup.
+    let state_timer = Arc::clone(&state);
+    let udp_timer = Arc::clone(&udp);
+    let running_timer = Arc::clone(&running);
+    let timer = thread::spawn(move || {
+        while running_timer.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(1));
+
+            let mut st = state_timer.lock().unwrap();
+
+            // Collect handshake retry requests (avoids borrow conflict).
+            let mut rekey_requests: Vec<(usize, SocketAddr)> = Vec::new();
+
+            for (i, peer) in st.peers.iter_mut().enumerate() {
+                // Zero dead sessions.
+                if peer.timers.is_dead() && peer.session.is_some() {
+                    println!(
+                        "session expired for {}",
+                        base64_key(peer.public_key.as_bytes()),
+                    );
+                    peer.session = None;
+                }
+
+                // Send keepalive if needed.
+                if let Some(session) = &mut peer.session {
+                    if peer.timers.needs_keepalive(peer.persistent_keepalive) {
+                        if let Some(endpoint) = peer.endpoint {
+                            let (counter, ciphertext) = session.encrypt(&[]);
+                            peer.timers.packet_sent();
+                            let transport = Transport {
+                                receiver_index: session.their_index,
+                                counter,
+                                payload: ciphertext,
+                            };
+                            let wire = transport.to_bytes();
+                            let _ = udp_timer.send_to(&wire, endpoint);
+                        }
+                    }
+                }
+
+                // Queue handshake retry if needed.
+                if !peer.has_active_session()
+                    && peer.timers.should_retry_handshake()
+                    && !peer.timers.handshake_timed_out()
+                {
+                    if let Some(endpoint) = peer.endpoint {
+                        rekey_requests.push((i, endpoint));
+                    }
+                }
+            }
+
+            // Process handshake retries outside the peer loop.
+            for (idx, endpoint) in rekey_requests {
+                let sender_index = rand_index();
+                let (init_msg, init_state) = handshake::create_initiation(
+                    &st.our_static,
+                    &st.peers[idx].public_key,
+                    sender_index,
+                );
+                st.pending_handshakes.push((sender_index, init_state));
+                st.peers[idx].timers.last_handshake_sent =
+                    Some(std::time::Instant::now());
+
+                let wire = init_msg.to_bytes();
+                let _ = udp_timer.send_to(&wire, endpoint);
+                println!(
+                    "retrying handshake with {}",
+                    base64_key(st.peers[idx].public_key.as_bytes()),
+                );
+            }
+        }
+    });
+
+    // Wait for shutdown.
     outbound.join().unwrap();
     inbound.join().unwrap();
+    timer.join().unwrap();
+
+    // Clean up routes.
+    println!("cleaning up routes...");
+    for entry in &routes_added {
+        let _ = delete_route(&entry.route, &entry.interface);
+        println!("route delete {}", entry.route);
+    }
+
+    println!("shutdown complete");
     Ok(())
 }
 
-fn rand_u32() -> u32 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos()
+/// Generate a random u32 sender index using OS entropy.
+fn rand_index() -> u32 {
+    let mut buf = [0u8; 4];
+    getrandom(&mut buf);
+    u32::from_le_bytes(buf)
 }
+
+/// Read random bytes from the OS.
+fn getrandom(buf: &mut [u8]) {
+    use std::fs::File;
+    use std::io::Read;
+    File::open("/dev/urandom")
+        .expect("failed to open /dev/urandom")
+        .read_exact(buf)
+        .expect("failed to read /dev/urandom");
+}
+
+/// Install a Ctrl-C / SIGTERM handler.
+fn ctrlc_handler(f: impl FnOnce() + Send + 'static) {
+    // Simple approach: spawn a thread that blocks on a signal.
+    let f = std::sync::Mutex::new(Some(f));
+    unsafe {
+        libc::signal(libc::SIGINT, signal_noop as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_noop as *const () as libc::sighandler_t);
+    }
+    thread::spawn(move || {
+        let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sigset);
+            libc::sigaddset(&mut sigset, libc::SIGINT);
+            libc::sigaddset(&mut sigset, libc::SIGTERM);
+            libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+            let mut sig: libc::c_int = 0;
+            libc::sigwait(&sigset, &mut sig);
+        }
+        if let Some(f) = f.lock().unwrap().take() {
+            f();
+        }
+    });
+}
+
+extern "C" fn signal_noop(_: libc::c_int) {}
 
 fn base64_key(key: &[u8; 32]) -> String {
     use base64::prelude::*;
     BASE64_STANDARD.encode(key)
+}
+
+/// Platform-specific route management.
+#[cfg(target_os = "macos")]
+fn add_route(route: &str, interface: &str) -> io::Result<std::process::Output> {
+    Command::new("route")
+        .args(["-n", "add", "-net", route, "-interface", interface])
+        .output()
+}
+
+#[cfg(target_os = "macos")]
+fn delete_route(route: &str, interface: &str) -> io::Result<std::process::Output> {
+    Command::new("route")
+        .args(["-n", "delete", "-net", route, "-interface", interface])
+        .output()
+}
+
+#[cfg(target_os = "linux")]
+fn add_route(route: &str, interface: &str) -> io::Result<std::process::Output> {
+    Command::new("ip")
+        .args(["route", "add", route, "dev", interface])
+        .output()
+}
+
+#[cfg(target_os = "linux")]
+fn delete_route(route: &str, interface: &str) -> io::Result<std::process::Output> {
+    Command::new("ip")
+        .args(["route", "del", route, "dev", interface])
+        .output()
 }
