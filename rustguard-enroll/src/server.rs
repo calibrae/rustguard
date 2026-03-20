@@ -53,6 +53,8 @@ pub struct ServeConfig {
     pub token: String,
     pub open_immediately: bool,
     pub state_path: Option<std::path::PathBuf>,
+    /// Interface name for AF_XDP fast path. None = standard UDP socket.
+    pub xdp_ifname: Option<String>,
 }
 
 pub fn run(config: ServeConfig) -> io::Result<()> {
@@ -97,6 +99,29 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
         UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.listen_port)))?,
     );
     udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    // Set up AF_XDP fast path if requested.
+    #[cfg(target_os = "linux")]
+    let xdp_state: Option<(rustguard_tun::bpf_loader::XdpProgram, rustguard_tun::xdp::XdpSocket)> =
+        if let Some(ref ifname) = config.xdp_ifname {
+            match setup_xdp(ifname) {
+                Ok((prog, xsk)) => {
+                    println!("AF_XDP: active on {ifname} (zero-copy fast path)");
+                    Some((prog, xsk))
+                }
+                Err(e) => {
+                    eprintln!("AF_XDP failed ({e}), falling back to standard UDP");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    #[cfg(not(target_os = "linux"))]
+    let xdp_state: Option<()> = None;
+
+    let use_xdp = xdp_state.is_some();
 
     let peer_count = Arc::new(Mutex::new(0usize));
     let sock_path = control::start_listener(Arc::clone(&window), Arc::clone(&peer_count))?;
@@ -187,166 +212,177 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
         }
     });
 
-    // ── Inbound: UDP -> decrypt -> TUN  (+ enrollment + handshake) ──
+    // ── Inbound: UDP/XDP -> decrypt -> TUN  (+ enrollment + handshake) ──
     let tun_in = Arc::clone(&tun);
     let udp_in = Arc::clone(&udp);
     let state_in = Arc::clone(&state);
     let running_in = Arc::clone(&running);
     let window_in = Arc::clone(&window);
     let peer_count_in = Arc::clone(&peer_count);
+
+    // Split XDP state: socket goes to inbound thread, program stays here (keeps BPF attached).
+    #[cfg(target_os = "linux")]
+    let (xdp_xsk, _xdp_prog) = match xdp_state {
+        Some((prog, xsk)) => (Some(Arc::new(Mutex::new(xsk))), Some(prog)),
+        None => (None, None),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let xdp_xsk: Option<Arc<Mutex<()>>> = None;
+
     let inbound = thread::spawn(move || {
         let mut batch = crate::fast_udp::RecvBatch::new();
+
         while running_in.load(Ordering::Relaxed) {
-            let count = match crate::fast_udp::recv_batch(&udp_in, &mut batch) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+            // Collect packets — either from AF_XDP or standard UDP.
+            let mut packets: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
 
-            for pkt_idx in 0..count {
-                let n = batch.lens[pkt_idx];
-                let src_addr = match batch.addrs[pkt_idx] {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let buf = &mut batch.bufs[pkt_idx];
-
-            if n < 4 {
-                continue;
+            #[cfg(target_os = "linux")]
+            if let Some(ref xsk_mtx) = xdp_xsk {
+                let xsk = xsk_mtx.lock().unwrap();
+                let rx = xsk.rx_poll();
+                let mut frame_addrs = Vec::new();
+                for (addr, frame_data) in &rx {
+                    frame_addrs.push(*addr);
+                    if let Some(parsed) = crate::packet::parse_eth_udp(frame_data) {
+                        packets.push((parsed.src_addr, parsed.payload.to_vec()));
+                    }
+                }
+                drop(xsk);
+                if !frame_addrs.is_empty() {
+                    xsk_mtx.lock().unwrap().rx_release(&frame_addrs);
+                }
             }
 
-            // ── Enrollment ──
-            if n >= protocol::ENROLL_REQUEST_SIZE && buf[0..4] == [0x52, 0x47, 0x45, 0x01] {
-                if !control::is_open(&window_in) {
+            // Always also check standard UDP (for enrollment, handshake, fallback).
+            if let Ok(count) = crate::fast_udp::recv_batch(&udp_in, &mut batch) {
+                for i in 0..count {
+                    if let Some(addr) = batch.addrs[i] {
+                        packets.push((addr, batch.bufs[i][..batch.lens[i]].to_vec()));
+                    }
+                }
+            }
+
+            for (src_addr, pkt) in &packets {
+                let src_addr = *src_addr;
+                let buf = pkt.as_slice();
+                let n = buf.len();
+
+                if n < 4 {
                     continue;
                 }
-                if let Some(client_pubkey) = protocol::parse_request(&state_in.token_key, &buf[..n]) {
-                    let peers = state_in.peers.read().unwrap();
-                    let existing = peers.iter().find(|p| *p.public_key.as_bytes() == client_pubkey);
-                    if let Some(peer) = existing {
-                        let offer = protocol::EnrollmentOffer {
-                            server_pubkey: state_in.our_public_bytes,
-                            assigned_ip: peer.assigned_ip,
-                            prefix_len: state_in.pool.lock().unwrap().prefix_len,
-                        };
-                        let resp = protocol::build_response(&state_in.token_key, &offer);
-                        let _ = udp_in.send_to(&resp, src_addr);
+
+                // ── Enrollment ──
+                if n >= protocol::ENROLL_REQUEST_SIZE && buf[0..4] == [0x52, 0x47, 0x45, 0x01] {
+                    if !control::is_open(&window_in) {
                         continue;
                     }
-                    drop(peers);
-
-                    let mut pool = state_in.pool.lock().unwrap();
-                    let Some(assigned_ip) = pool.allocate() else {
-                        eprintln!("pool exhausted");
-                        continue;
-                    };
-                    let prefix_len = pool.prefix_len;
-                    drop(pool);
-
-                    let rem = control::remaining(&window_in);
-                    println!("enrolled peer {} -> {assigned_ip} ({rem}s remaining)", base64_key(&client_pubkey));
-
-                    let offer = protocol::EnrollmentOffer {
-                        server_pubkey: state_in.our_public_bytes,
-                        assigned_ip,
-                        prefix_len,
-                    };
-                    let resp = protocol::build_response(&state_in.token_key, &offer);
-                    let _ = udp_in.send_to(&resp, src_addr);
-
-                    let new_peer = Arc::new(EnrolledPeer {
-                        public_key: PublicKey::from_bytes(client_pubkey),
-                        assigned_ip,
-                        state: Mutex::new(PeerState {
-                            endpoint: Some(src_addr),
-                            session: None,
-                            timers: rustguard_core::timers::SessionTimers::new(),
-                        }),
-                    });
-
-                    let mut peers = state_in.peers.write().unwrap();
-                    peers.push(new_peer);
-                    *peer_count_in.lock().unwrap() = peers.len();
-
-                    if let Some(ref path) = state_in.state_path {
-                        let persisted: Vec<PersistedPeer> = peers.iter().map(|p| PersistedPeer {
-                            public_key: *p.public_key.as_bytes(),
-                            assigned_ip: p.assigned_ip,
-                        }).collect();
-                        let _ = state::save(path, &persisted);
-                    }
-                }
-                continue;
-            }
-
-            // ── WireGuard messages ──
-            let msg_type = u32::from_le_bytes(buf[..4].try_into().unwrap());
-
-            match msg_type {
-                MSG_INITIATION if n >= INITIATION_SIZE => {
-                    let msg = Initiation::from_bytes(buf[..INITIATION_SIZE].try_into().unwrap());
-                    let responder_index = rand_index();
-
-                    let result = handshake::process_initiation(
-                        &state_in.our_static, &msg, responder_index,
-                    );
-
-                    if let Some((peer_pubkey, _ts, resp_msg, session)) = result {
+                    if let Some(client_pubkey) = protocol::parse_request(&state_in.token_key, buf) {
                         let peers = state_in.peers.read().unwrap();
-                        if let Some(peer) = peers.iter().find(|p| p.public_key == peer_pubkey) {
-                            let mut ps = peer.state.lock().unwrap();
-                            ps.session = Some(session);
-                            ps.endpoint = Some(src_addr);
-                            ps.timers.session_started();
-                            drop(ps);
-                            let _ = udp_in.send_to(&resp_msg.to_bytes(), src_addr);
-                            println!("handshake with {} ({})", base64_key(peer_pubkey.as_bytes()), peer.assigned_ip);
+                        if let Some(peer) = peers.iter().find(|p| *p.public_key.as_bytes() == client_pubkey) {
+                            let offer = protocol::EnrollmentOffer {
+                                server_pubkey: state_in.our_public_bytes,
+                                assigned_ip: peer.assigned_ip,
+                                prefix_len: state_in.pool.lock().unwrap().prefix_len,
+                            };
+                            let resp = protocol::build_response(&state_in.token_key, &offer);
+                            let _ = udp_in.send_to(&resp, src_addr);
+                            continue;
+                        }
+                        drop(peers);
+
+                        let mut pool = state_in.pool.lock().unwrap();
+                        let Some(assigned_ip) = pool.allocate() else { continue };
+                        let prefix_len = pool.prefix_len;
+                        drop(pool);
+
+                        println!("enrolled peer {} -> {assigned_ip} ({}s remaining)",
+                            base64_key(&client_pubkey), control::remaining(&window_in));
+
+                        let offer = protocol::EnrollmentOffer {
+                            server_pubkey: state_in.our_public_bytes, assigned_ip, prefix_len,
+                        };
+                        let _ = udp_in.send_to(&protocol::build_response(&state_in.token_key, &offer), src_addr);
+
+                        let new_peer = Arc::new(EnrolledPeer {
+                            public_key: PublicKey::from_bytes(client_pubkey),
+                            assigned_ip,
+                            state: Mutex::new(PeerState {
+                                endpoint: Some(src_addr), session: None,
+                                timers: rustguard_core::timers::SessionTimers::new(),
+                            }),
+                        });
+                        let mut peers = state_in.peers.write().unwrap();
+                        peers.push(new_peer);
+                        *peer_count_in.lock().unwrap() = peers.len();
+                        if let Some(ref path) = state_in.state_path {
+                            let persisted: Vec<PersistedPeer> = peers.iter().map(|p| PersistedPeer {
+                                public_key: *p.public_key.as_bytes(), assigned_ip: p.assigned_ip,
+                            }).collect();
+                            let _ = state::save(path, &persisted);
                         }
                     }
+                    continue;
                 }
 
-                MSG_TRANSPORT if n >= TRANSPORT_HEADER_SIZE => {
-                    let receiver_index = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                    let counter = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-                    let ct_len = n - TRANSPORT_HEADER_SIZE;
+                // ── WireGuard ──
+                let msg_type = u32::from_le_bytes(buf[..4].try_into().unwrap());
 
-                    // Read-lock to find peer.
-                    let peers = state_in.peers.read().unwrap();
-                    let peer = peers.iter().find(|p| {
-                        let ps = p.state.lock().unwrap();
-                        ps.session.as_ref().is_some_and(|s| s.our_index == receiver_index)
-                    });
-                    let Some(peer) = peer else { continue };
-                    let peer = Arc::clone(peer);
-                    drop(peers);
-
-                    // Per-peer lock: decrypt in place.
-                    let mut ps = peer.state.lock().unwrap();
-                    ps.endpoint = Some(src_addr);
-
-                    if let Some(session) = &mut ps.session {
-                        // Decrypt directly in the receive buffer — zero alloc.
-                        let payload_start = TRANSPORT_HEADER_SIZE;
-                        if let Some(pt_len) = session.decrypt_in_place(
-                            counter,
-                            &mut buf[payload_start..],
-                            ct_len,
-                        ) {
-                            ps.timers.packet_received();
-                            drop(ps);
-                            let _ = tun_in.write(&buf[payload_start..payload_start + pt_len]);
+                match msg_type {
+                    MSG_INITIATION if n >= INITIATION_SIZE => {
+                        let msg = Initiation::from_bytes(buf[..INITIATION_SIZE].try_into().unwrap());
+                        let result = handshake::process_initiation(&state_in.our_static, &msg, rand_index());
+                        if let Some((pk, _ts, resp, session)) = result {
+                            let peers = state_in.peers.read().unwrap();
+                            if let Some(peer) = peers.iter().find(|p| p.public_key == pk) {
+                                let mut ps = peer.state.lock().unwrap();
+                                ps.session = Some(session);
+                                ps.endpoint = Some(src_addr);
+                                ps.timers.session_started();
+                                drop(ps);
+                                let _ = udp_in.send_to(&resp.to_bytes(), src_addr);
+                                println!("handshake with {} ({})", base64_key(pk.as_bytes()), peer.assigned_ip);
+                            }
                         }
                     }
-                }
 
-                _ => {}
+                    MSG_TRANSPORT if n >= TRANSPORT_HEADER_SIZE => {
+                        let receiver_index = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                        let counter = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+
+                        let peers = state_in.peers.read().unwrap();
+                        let peer = peers.iter().find(|p| {
+                            let ps = p.state.lock().unwrap();
+                            ps.session.as_ref().is_some_and(|s| s.our_index == receiver_index)
+                        });
+                        let Some(peer) = peer else { continue };
+                        let peer = Arc::clone(peer);
+                        drop(peers);
+
+                        let mut ps = peer.state.lock().unwrap();
+                        ps.endpoint = Some(src_addr);
+                        if let Some(session) = &mut ps.session {
+                            let mut decrypt_buf = [0u8; 2048];
+                            let ct = &buf[TRANSPORT_HEADER_SIZE..];
+                            decrypt_buf[..ct.len()].copy_from_slice(ct);
+                            if let Some(pt_len) = session.decrypt_in_place(counter, &mut decrypt_buf, ct.len()) {
+                                ps.timers.packet_received();
+                                drop(ps);
+                                let _ = tun_in.write(&decrypt_buf[..pt_len]);
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
             }
-            } // end for pkt_idx
         }
     });
 
     outbound.join().unwrap();
     inbound.join().unwrap();
     control::cleanup(&sock_path);
+
+    // _xdp_prog drops here — detaches BPF from interface.
     Ok(())
 }
 
@@ -359,4 +395,33 @@ fn rand_index() -> u32 {
 fn base64_key(key: &[u8; 32]) -> String {
     use base64::prelude::*;
     BASE64_STANDARD.encode(key)
+}
+
+/// Set up AF_XDP: load BPF program, create XSK, register in XSKMAP.
+#[cfg(target_os = "linux")]
+fn setup_xdp(
+    ifname: &str,
+) -> io::Result<(
+    rustguard_tun::bpf_loader::XdpProgram,
+    rustguard_tun::xdp::XdpSocket,
+)> {
+    use rustguard_tun::bpf_loader::XdpProgram;
+    use rustguard_tun::xdp::{XdpConfig, XdpSocket};
+
+    // Load and attach BPF program.
+    let prog = XdpProgram::load_and_attach(ifname)?;
+
+    // Create AF_XDP socket.
+    let xsk = XdpSocket::create(&XdpConfig {
+        ifname: ifname.to_string(),
+        queue_id: 0,
+        frame_size: 4096,
+        num_frames: 4096,
+        ring_size: 2048,
+    })?;
+
+    // Register XSK in the XSKMAP so BPF redirects to it.
+    prog.register_xsk(0, xsk.fd())?;
+
+    Ok((prog, xsk))
 }

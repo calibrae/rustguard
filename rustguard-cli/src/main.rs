@@ -70,6 +70,7 @@ fn cmd_serve(args: &[String]) {
     let mut token = None;
     let mut port = 51820u16;
     let mut open_immediately = false;
+    let mut xdp_ifname = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -84,6 +85,10 @@ fn cmd_serve(args: &[String]) {
             }
             "--open" => {
                 open_immediately = true;
+            }
+            "--xdp" => {
+                i += 1;
+                xdp_ifname = Some(args.get(i).cloned().unwrap_or_default());
             }
             "--port" => {
                 i += 1;
@@ -126,6 +131,7 @@ fn cmd_serve(args: &[String]) {
         token,
         open_immediately,
         state_path: Some(rustguard_enroll::state::default_state_path()),
+        xdp_ifname,
     };
 
     if let Err(e) = rustguard_enroll::server::run(config) {
