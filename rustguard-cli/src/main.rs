@@ -8,6 +8,8 @@ fn main() {
 
     match args.get(1).map(|s| s.as_str()) {
         Some("up") => cmd_up(&args[2..]),
+        Some("serve") => cmd_serve(&args[2..]),
+        Some("join") => cmd_join(&args[2..]),
         Some("genkey") => cmd_genkey(),
         Some("pubkey") => cmd_pubkey(),
         Some(cmd) => {
@@ -26,9 +28,11 @@ fn usage() {
     eprintln!("usage: rustguard <command>");
     eprintln!();
     eprintln!("commands:");
-    eprintln!("  up <config>   bring up a WireGuard interface");
-    eprintln!("  genkey        generate a private key");
-    eprintln!("  pubkey        derive public key from private key on stdin");
+    eprintln!("  up <config>                          bring up a WireGuard tunnel (standard mode)");
+    eprintln!("  serve --pool <cidr> --token <token>   open enrollment server (zero-config mode)");
+    eprintln!("  join <endpoint> --token <token>        join a server (zero-config mode)");
+    eprintln!("  genkey                                generate a private key");
+    eprintln!("  pubkey                                derive public key from stdin");
 }
 
 fn cmd_up(args: &[String]) {
@@ -55,6 +59,116 @@ fn cmd_up(args: &[String]) {
     }
 }
 
+fn cmd_serve(args: &[String]) {
+    let mut pool = None;
+    let mut token = None;
+    let mut port = 51820u16;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pool" => {
+                i += 1;
+                pool = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            "--token" => {
+                i += 1;
+                token = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            "--port" => {
+                i += 1;
+                port = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(51820);
+            }
+            _ => {
+                eprintln!("unknown option: {}", args[i]);
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let pool_str = pool.unwrap_or_else(|| {
+        eprintln!("usage: rustguard serve --pool <cidr> --token <token>");
+        process::exit(1);
+    });
+    let token = token.unwrap_or_else(|| {
+        eprintln!("usage: rustguard serve --pool <cidr> --token <token>");
+        process::exit(1);
+    });
+
+    let (net_str, prefix_str) = pool_str.split_once('/').unwrap_or((&pool_str, "24"));
+    let network: std::net::Ipv4Addr = net_str.parse().unwrap_or_else(|e| {
+        eprintln!("bad pool address: {e}");
+        process::exit(1);
+    });
+    let prefix: u8 = prefix_str.parse().unwrap_or_else(|e| {
+        eprintln!("bad pool prefix: {e}");
+        process::exit(1);
+    });
+
+    let config = rustguard_enroll::server::ServeConfig {
+        listen_port: port,
+        pool_network: network,
+        pool_prefix: prefix,
+        token,
+    };
+
+    if let Err(e) = rustguard_enroll::server::run(config) {
+        eprintln!("serve error: {e}");
+        process::exit(1);
+    }
+}
+
+fn cmd_join(args: &[String]) {
+    let mut endpoint = None;
+    let mut token = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" => {
+                i += 1;
+                token = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            s if !s.starts_with('-') && endpoint.is_none() => {
+                endpoint = Some(s.to_string());
+            }
+            _ => {
+                eprintln!("unknown option: {}", args[i]);
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let endpoint_str = endpoint.unwrap_or_else(|| {
+        eprintln!("usage: rustguard join <endpoint> --token <token>");
+        process::exit(1);
+    });
+    let token = token.unwrap_or_else(|| {
+        eprintln!("usage: rustguard join <endpoint> --token <token>");
+        process::exit(1);
+    });
+
+    let server_endpoint: std::net::SocketAddr = endpoint_str.parse().unwrap_or_else(|e| {
+        eprintln!("bad endpoint: {e}");
+        process::exit(1);
+    });
+
+    let config = rustguard_enroll::client::JoinConfig {
+        server_endpoint,
+        token,
+    };
+
+    if let Err(e) = rustguard_enroll::client::run(config) {
+        eprintln!("join error: {e}");
+        process::exit(1);
+    }
+}
+
 fn cmd_genkey() {
     use base64::prelude::*;
     let secret = rustguard_crypto::StaticSecret::random();
@@ -64,7 +178,9 @@ fn cmd_genkey() {
 fn cmd_pubkey() {
     use base64::prelude::*;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).expect("failed to read stdin");
+    std::io::stdin()
+        .read_line(&mut input)
+        .expect("failed to read stdin");
     let bytes = BASE64_STANDARD
         .decode(input.trim())
         .expect("invalid base64");

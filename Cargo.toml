@@ -5,6 +5,7 @@ members = [
     "rustguard-tun",
     "rustguard-daemon",
     "rustguard-cli",
+    "rustguard-enroll",
 ]
 resolver = "2"
 

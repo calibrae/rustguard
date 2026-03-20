@@ -281,7 +281,7 @@ fn parse_cidr(s: &str) -> io::Result<CidrAddr> {
     Ok(CidrAddr { addr, prefix_len })
 }
 
-fn prefix_to_netmask(prefix: u8) -> Ipv4Addr {
+pub fn prefix_to_netmask(prefix: u8) -> Ipv4Addr {
     if prefix == 0 {
         Ipv4Addr::new(0, 0, 0, 0)
     } else if prefix >= 32 {

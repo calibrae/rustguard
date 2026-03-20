@@ -11,5 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 rustguard-daemon = { path = "../rustguard-daemon" }
+rustguard-enroll = { path = "../rustguard-enroll" }
 rustguard-crypto = { path = "../rustguard-crypto" }
 base64 = "0.22"
