@@ -7,3 +7,6 @@ description = "Cross-platform TUN device abstraction for RustGuard"
 
 [dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"

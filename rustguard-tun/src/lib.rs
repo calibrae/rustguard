@@ -10,6 +10,9 @@ mod linux;
 pub mod linux_mq;
 
 #[cfg(target_os = "linux")]
+pub mod uring;
+
+#[cfg(target_os = "linux")]
 pub mod xdp;
 
 #[cfg(target_os = "linux")]
@@ -51,6 +54,11 @@ impl Tun {
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return Err(io::Error::new(io::ErrorKind::Unsupported, "unsupported platform"));
+    }
+
+    /// Raw file descriptor. Needed for io_uring and AF_XDP integration.
+    pub fn raw_fd(&self) -> i32 {
+        self.fd
     }
 
     /// Interface name (e.g. "utun3").

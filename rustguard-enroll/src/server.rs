@@ -57,6 +57,8 @@ pub struct ServeConfig {
     pub xdp_ifname: Option<String>,
     /// Number of TUN queues (multi-queue TUN). 0 or 1 = single queue.
     pub tun_queues: usize,
+    /// Use io_uring for TUN I/O.
+    pub use_uring: bool,
 }
 
 pub fn run(config: ServeConfig) -> io::Result<()> {
@@ -187,9 +189,100 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
 
-    // ── Outbound workers: TUN -> encrypt -> UDP ──
-    // One worker per TUN queue. Each reads from its own queue, encrypts, sends UDP.
+    // ── Outbound: TUN -> encrypt -> UDP ──
     let mut outbound_threads = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    if config.use_uring {
+        // io_uring outbound: batched TUN reads in a single thread.
+        let state_out = Arc::clone(&state);
+        let udp_out = Arc::clone(&udp);
+        let running_out = Arc::clone(&running);
+        let tun_clone = Arc::clone(&tun);
+
+        println!("io_uring: active (batched TUN I/O)");
+
+        outbound_threads.push(thread::spawn(move || {
+            let mut uring = match rustguard_tun::uring::UringTun::new(
+                // Get the raw fd from the Tun. We access it via a small helper.
+                tun_clone.raw_fd(),
+            ) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("io_uring init failed: {e}");
+                    return;
+                }
+            };
+
+            let mut ct_buf = [0u8; 1500 + AEAD_TAG_LEN + TRANSPORT_HEADER_SIZE];
+
+            while running_out.load(Ordering::Relaxed) {
+                let completions = match uring.submit_and_wait(1) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                for comp in completions {
+                    if !comp.is_read || comp.result <= 0 {
+                        uring.bufs.free(comp.buf_idx);
+                        continue;
+                    }
+
+                    let n = comp.result as usize;
+                    let pkt = uring.bufs.slot(comp.buf_idx);
+
+                    if n < 20 {
+                        uring.bufs.free(comp.buf_idx);
+                        continue;
+                    }
+
+                    let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+
+                    let peers = state_out.peers.read().unwrap();
+                    let peer = peers.iter().find(|p| p.assigned_ip == dst_ip);
+                    let peer = match peer {
+                        Some(p) => Arc::clone(p),
+                        None => { uring.bufs.free(comp.buf_idx); continue; }
+                    };
+                    drop(peers);
+
+                    let mut ps = peer.state.lock().unwrap();
+                    let (endpoint, their_index) = match (&ps.endpoint, &ps.session) {
+                        (Some(ep), Some(s)) => (*ep, s.their_index),
+                        _ => { uring.bufs.free(comp.buf_idx); continue; }
+                    };
+
+                    let session = ps.session.as_mut().unwrap();
+                    if let Some((counter, ct_len)) = session.encrypt_to(
+                        &pkt[..n],
+                        &mut ct_buf[TRANSPORT_HEADER_SIZE..],
+                    ) {
+                        drop(ps);
+                        ct_buf[0..4].copy_from_slice(&MSG_TRANSPORT.to_le_bytes());
+                        ct_buf[4..8].copy_from_slice(&their_index.to_le_bytes());
+                        ct_buf[8..16].copy_from_slice(&counter.to_le_bytes());
+                        let total = TRANSPORT_HEADER_SIZE + ct_len;
+                        let _ = udp_out.send_to(&ct_buf[..total], endpoint);
+                    } else {
+                        drop(ps);
+                    }
+
+                    uring.bufs.free(comp.buf_idx);
+                }
+            }
+        }));
+    }
+
+    // Standard outbound workers (when not using io_uring).
+    #[allow(unused_variables)]
+    let skip_standard = {
+        #[cfg(target_os = "linux")]
+        { config.use_uring }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    };
+
+    if !skip_standard {
     for queue_id in 0..actual_queues {
         let state_out = Arc::clone(&state);
         let udp_out = Arc::clone(&udp);
@@ -260,6 +353,7 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
             }
         }));
     }
+    } // end if !skip_standard
 
     // ── Inbound: UDP/XDP -> decrypt -> TUN  (+ enrollment + handshake) ──
     let tun_in = Arc::clone(&tun);
@@ -442,6 +536,7 @@ fn rand_index() -> u32 {
     getrandom::getrandom(&mut buf).expect("rng");
     u32::from_le_bytes(buf)
 }
+
 
 fn base64_key(key: &[u8; 32]) -> String {
     use base64::prelude::*;

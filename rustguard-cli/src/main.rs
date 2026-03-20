@@ -72,6 +72,7 @@ fn cmd_serve(args: &[String]) {
     let mut open_immediately = false;
     let mut xdp_ifname = None;
     let mut tun_queues = 1usize;
+    let mut use_uring = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -94,6 +95,9 @@ fn cmd_serve(args: &[String]) {
             "--queues" => {
                 i += 1;
                 tun_queues = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            "--uring" => {
+                use_uring = true;
             }
             "--port" => {
                 i += 1;
@@ -138,6 +142,7 @@ fn cmd_serve(args: &[String]) {
         state_path: Some(rustguard_enroll::state::default_state_path()),
         xdp_ifname,
         tun_queues,
+        use_uring,
     };
 
     if let Err(e) = rustguard_enroll::server::run(config) {
