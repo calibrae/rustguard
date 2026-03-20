@@ -10,6 +10,9 @@ fn main() {
         Some("up") => cmd_up(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
         Some("join") => cmd_join(&args[2..]),
+        Some("open") => cmd_open(&args[2..]),
+        Some("close") => cmd_close(),
+        Some("status") => cmd_status(),
         Some("genkey") => cmd_genkey(),
         Some("pubkey") => cmd_pubkey(),
         Some(cmd) => {
@@ -29,8 +32,11 @@ fn usage() {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  up <config>                          bring up a WireGuard tunnel (standard mode)");
-    eprintln!("  serve --pool <cidr> --token <token>   open enrollment server (zero-config mode)");
-    eprintln!("  join <endpoint> --token <token>        join a server (zero-config mode)");
+    eprintln!("  serve --pool <cidr> --token <token>   start enrollment server");
+    eprintln!("  join <endpoint> --token <token>       join a server (zero-config mode)");
+    eprintln!("  open [seconds]                        open enrollment window (default 60s)");
+    eprintln!("  close                                 close enrollment window");
+    eprintln!("  status                                show server status");
     eprintln!("  genkey                                generate a private key");
     eprintln!("  pubkey                                derive public key from stdin");
 }
@@ -63,6 +69,7 @@ fn cmd_serve(args: &[String]) {
     let mut pool = None;
     let mut token = None;
     let mut port = 51820u16;
+    let mut open_immediately = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -74,6 +81,9 @@ fn cmd_serve(args: &[String]) {
             "--token" => {
                 i += 1;
                 token = Some(args.get(i).cloned().unwrap_or_default());
+            }
+            "--open" => {
+                open_immediately = true;
             }
             "--port" => {
                 i += 1;
@@ -114,6 +124,7 @@ fn cmd_serve(args: &[String]) {
         pool_network: network,
         pool_prefix: prefix,
         token,
+        open_immediately,
     };
 
     if let Err(e) = rustguard_enroll::server::run(config) {
@@ -166,6 +177,41 @@ fn cmd_join(args: &[String]) {
     if let Err(e) = rustguard_enroll::client::run(config) {
         eprintln!("join error: {e}");
         process::exit(1);
+    }
+}
+
+fn cmd_open(args: &[String]) {
+    let secs: u64 = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    match rustguard_enroll::control::send_command(&format!("OPEN {secs}")) {
+        Ok(resp) => print!("{resp}"),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    }
+}
+
+fn cmd_close() {
+    match rustguard_enroll::control::send_command("CLOSE") {
+        Ok(resp) => print!("{resp}"),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    }
+}
+
+fn cmd_status() {
+    match rustguard_enroll::control::send_command("STATUS") {
+        Ok(resp) => print!("{resp}"),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
     }
 }
 

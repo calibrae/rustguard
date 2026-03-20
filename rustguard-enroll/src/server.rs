@@ -1,7 +1,8 @@
 //! Enrollment server: accepts new peers, assigns IPs, runs the tunnel.
 //!
-//! This is the "open mode" — a WireGuard server that dynamically accepts
-//! new peers via the enrollment protocol, then runs a standard tunnel.
+//! Enrollment is gated by a time window controlled via the UNIX socket.
+//! By default enrollment is CLOSED. Use `rustguard open [seconds]` to
+//! temporarily allow new peers to join — like Zigbee pairing mode.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -15,6 +16,7 @@ use rustguard_core::messages::*;
 use rustguard_crypto::{PublicKey, StaticSecret};
 use rustguard_tun::{Tun, TunConfig};
 
+use crate::control::{self, EnrollmentWindow};
 use crate::pool::IpPool;
 use crate::protocol;
 
@@ -42,6 +44,8 @@ pub struct ServeConfig {
     pub pool_network: Ipv4Addr,
     pub pool_prefix: u8,
     pub token: String,
+    /// If true, enrollment starts open immediately (legacy behavior).
+    pub open_immediately: bool,
 }
 
 pub fn run(config: ServeConfig) -> io::Result<()> {
@@ -59,25 +63,40 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
         name: None,
         mtu: 1420,
         address: pool.server_addr,
-        destination: pool.server_addr, // Will route via AllowedIPs.
+        destination: pool.server_addr,
         netmask: rustguard_daemon::config::prefix_to_netmask(config.pool_prefix),
     })?);
 
-    println!("rustguard serve (open mode)");
+    println!("rustguard serve");
     println!("interface: {}", tun.name());
     println!("address: {}/{}", pool.server_addr, config.pool_prefix);
     println!("listening on 0.0.0.0:{}", config.listen_port);
-    println!("enrollment: active (token required)");
-    println!("pool: {}/{} ({} addresses available)",
-        config.pool_network, config.pool_prefix,
-        (1u32 << (32 - config.pool_prefix)) - 3 // minus network, server, broadcast
+    println!(
+        "pool: {}/{} ({} addresses available)",
+        config.pool_network,
+        config.pool_prefix,
+        (1u32 << (32 - config.pool_prefix)) - 3
     );
+
+    // Enrollment window — default closed unless --open flag.
+    let window = control::new_window();
+    if config.open_immediately {
+        control::open_window(&window, 3600); // 1 hour for --open mode.
+        println!("enrollment: OPEN (use `rustguard close` to lock)");
+    } else {
+        println!("enrollment: CLOSED (use `rustguard open` to allow peers)");
+    }
     println!();
 
     let udp = Arc::new(
         UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.listen_port)))?,
     );
     udp.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    let peer_count = Arc::new(Mutex::new(0usize));
+
+    // Start control socket.
+    let sock_path = control::start_listener(Arc::clone(&window), Arc::clone(&peer_count))?;
 
     let state = Arc::new(Mutex::new(ServerState {
         our_static,
@@ -125,11 +144,13 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
         }
     });
 
-    // Inbound: UDP -> TUN (handles both enrollment and WireGuard messages).
+    // Inbound: UDP -> TUN (handles enrollment + WireGuard).
     let tun_in = Arc::clone(&tun);
     let udp_in = Arc::clone(&udp);
     let state_in = Arc::clone(&state);
     let running_in = Arc::clone(&running);
+    let window_in = Arc::clone(&window);
+    let peer_count_in = Arc::clone(&peer_count);
     let inbound = thread::spawn(move || {
         let mut buf = [0u8; 2048];
         while running_in.load(Ordering::Relaxed) {
@@ -143,15 +164,27 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                 continue;
             }
 
-            // Check if this is an enrollment request (our custom magic).
+            // Enrollment request?
             if n >= protocol::ENROLL_REQUEST_SIZE && buf[0..4] == [0x52, 0x47, 0x45, 0x01] {
+                // Gate on enrollment window.
+                if !control::is_open(&window_in) {
+                    // Silently drop — enrollment is closed.
+                    continue;
+                }
+
                 let mut st = state_in.lock().unwrap();
                 if let Some(client_pubkey) = protocol::parse_request(&st.token_key, &buf[..n]) {
-                    // Check if already enrolled.
-                    let already = st.peers.iter().any(|p| *p.public_key.as_bytes() == client_pubkey);
+                    // Already enrolled? Re-send assignment.
+                    let already = st
+                        .peers
+                        .iter()
+                        .any(|p| *p.public_key.as_bytes() == client_pubkey);
                     if already {
-                        // Re-send the existing assignment.
-                        if let Some(peer) = st.peers.iter().find(|p| *p.public_key.as_bytes() == client_pubkey) {
+                        if let Some(peer) = st
+                            .peers
+                            .iter()
+                            .find(|p| *p.public_key.as_bytes() == client_pubkey)
+                        {
                             let offer = protocol::EnrollmentOffer {
                                 server_pubkey: st.our_public_bytes,
                                 assigned_ip: peer.assigned_ip,
@@ -163,18 +196,17 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                         continue;
                     }
 
-                    // Allocate IP.
                     let Some(assigned_ip) = st.pool.allocate() else {
                         eprintln!("pool exhausted — rejecting enrollment from {src_addr}");
                         continue;
                     };
 
+                    let rem = control::remaining(&window_in);
                     println!(
-                        "enrolled peer {} -> {assigned_ip}",
+                        "enrolled peer {} -> {assigned_ip} ({rem}s remaining)",
                         base64_key(&client_pubkey),
                     );
 
-                    // Send response.
                     let offer = protocol::EnrollmentOffer {
                         server_pubkey: st.our_public_bytes,
                         assigned_ip,
@@ -183,7 +215,6 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                     let resp = protocol::build_response(&st.token_key, &offer);
                     let _ = udp_in.send_to(&resp, src_addr);
 
-                    // Add as peer.
                     st.peers.push(EnrolledPeer {
                         public_key: PublicKey::from_bytes(client_pubkey),
                         assigned_ip,
@@ -191,30 +222,38 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                         session: None,
                         timers: rustguard_core::timers::SessionTimers::new(),
                     });
+
+                    *peer_count_in.lock().unwrap() = st.peers.len();
                 }
                 continue;
             }
 
+            // Standard WireGuard messages — always processed (enrolled peers stay connected).
             let msg_type = u32::from_le_bytes(buf[..4].try_into().unwrap());
 
             match msg_type {
                 MSG_INITIATION if n >= INITIATION_SIZE => {
-                    let msg = Initiation::from_bytes(buf[..INITIATION_SIZE].try_into().unwrap());
+                    let msg =
+                        Initiation::from_bytes(buf[..INITIATION_SIZE].try_into().unwrap());
                     let mut st = state_in.lock().unwrap();
                     let responder_index = rand_index();
 
                     let result = handshake::process_initiation(
-                        &st.our_static, &msg, responder_index,
+                        &st.our_static,
+                        &msg,
+                        responder_index,
                     );
 
                     if let Some((peer_pubkey, _ts, resp_msg, session)) = result {
-                        if let Some(peer) = st.peers.iter_mut().find(|p| p.public_key == peer_pubkey) {
+                        if let Some(peer) =
+                            st.peers.iter_mut().find(|p| p.public_key == peer_pubkey)
+                        {
                             peer.session = Some(session);
                             peer.endpoint = Some(src_addr);
                             peer.timers.session_started();
                             let _ = udp_in.send_to(&resp_msg.to_bytes(), src_addr);
                             println!(
-                                "handshake complete with {} ({})",
+                                "handshake with {} ({})",
                                 base64_key(peer_pubkey.as_bytes()),
                                 peer.assigned_ip,
                             );
@@ -230,13 +269,17 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                     let mut st = state_in.lock().unwrap();
 
                     let peer = st.peers.iter_mut().find(|p| {
-                        p.session.as_ref().is_some_and(|s| s.our_index == msg.receiver_index)
+                        p.session
+                            .as_ref()
+                            .is_some_and(|s| s.our_index == msg.receiver_index)
                     });
 
                     if let Some(peer) = peer {
                         peer.endpoint = Some(src_addr);
                         if let Some(session) = &mut peer.session {
-                            if let Some(plaintext) = session.decrypt(msg.counter, &msg.payload) {
+                            if let Some(plaintext) =
+                                session.decrypt(msg.counter, &msg.payload)
+                            {
                                 peer.timers.packet_received();
                                 drop(st);
                                 let _ = tun_in.write(&plaintext);
@@ -252,6 +295,9 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
 
     outbound.join().unwrap();
     inbound.join().unwrap();
+
+    // Cleanup control socket.
+    control::cleanup(&sock_path);
     Ok(())
 }
 
