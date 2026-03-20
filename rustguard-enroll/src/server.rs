@@ -1,10 +1,11 @@
 //! Enrollment server: accepts new peers, assigns IPs, runs the tunnel.
 //!
 //! Performance-optimized packet path:
-//!   - Peers behind RwLock: concurrent reads for routing, writes only on enrollment
-//!   - Per-peer Mutex: peers don't block each other during encrypt/decrypt
-//!   - Zero-alloc crypto: encrypt/decrypt in pre-allocated stack buffers
-//!   - Lock released before I/O: crypto done while locked, syscalls done unlocked
+//!   - Peers behind RwLock: concurrent reads, writes only on enrollment
+//!   - Per-peer Mutex: peers don't block each other
+//!   - Zero-alloc crypto: in-place encrypt/decrypt in stack buffers
+//!   - recvmmsg: batch up to 32 UDP receives per syscall (Linux)
+//!   - Lock released before I/O
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -194,13 +195,20 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
     let window_in = Arc::clone(&window);
     let peer_count_in = Arc::clone(&peer_count);
     let inbound = thread::spawn(move || {
-        let mut buf = [0u8; 2048];
+        let mut batch = crate::fast_udp::RecvBatch::new();
         while running_in.load(Ordering::Relaxed) {
-            let (n, src_addr) = match udp_in.recv_from(&mut buf) {
-                Ok(r) => r,
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            let count = match crate::fast_udp::recv_batch(&udp_in, &mut batch) {
+                Ok(c) => c,
                 Err(_) => continue,
             };
+
+            for pkt_idx in 0..count {
+                let n = batch.lens[pkt_idx];
+                let src_addr = match batch.addrs[pkt_idx] {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let buf = &mut batch.bufs[pkt_idx];
 
             if n < 4 {
                 continue;
@@ -332,6 +340,7 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
 
                 _ => {}
             }
+            } // end for pkt_idx
         }
     });
 

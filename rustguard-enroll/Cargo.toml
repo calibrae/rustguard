@@ -12,3 +12,4 @@ rustguard-daemon = { path = "../rustguard-daemon" }
 rustguard-tun = { path = "../rustguard-tun" }
 base64 = "0.22"
 getrandom = "0.2"
+libc = "0.2"
