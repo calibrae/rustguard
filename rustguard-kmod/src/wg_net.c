@@ -5,9 +5,6 @@
  * The kernel's Rust bindings (6.12) don't expose net_device, sk_buff,
  * or the crypto API. This thin C layer handles device registration and
  * provides callback hooks that the Rust module implements.
- *
- * Think of it as the plumbing — Rust handles the protocol, C handles
- * the kernel API surface that doesn't have Rust abstractions yet.
  */
 
 #include <linux/module.h>
@@ -21,6 +18,15 @@
 
 #define WG_MTU 1420
 #define WG_NETDEV_NAME "wg%d"
+
+/* Prototypes for functions exported to Rust. */
+struct net_device *wg_create_device(void *rust_priv);
+void wg_destroy_device(struct net_device *dev);
+void wg_net_rx(struct net_device *dev, struct sk_buff *skb);
+struct sk_buff *wg_alloc_skb(unsigned int len);
+void wg_skb_data(struct sk_buff *skb, unsigned char **data, unsigned int *len);
+void wg_kfree_skb(struct sk_buff *skb);
+void wg_tx_stats(struct net_device *dev, unsigned int bytes);
 
 /* Forward declarations — implemented in Rust. */
 extern netdev_tx_t rustguard_xmit(struct sk_buff *skb, void *priv);
@@ -80,19 +86,10 @@ static void wg_setup(struct net_device *dev)
 	dev->addr_len = 0;
 	dev->needed_headroom = 0;
 	dev->needed_tailroom = 0;
-
-	/* No features — raw IP in, encrypted UDP out. */
-	dev->features |= NETIF_F_LLTX;
-	dev->features |= NETIF_F_NETNS_LOCAL;
 }
 
 /* ── Exported to Rust ──────────────────────────────────────────────── */
 
-/*
- * Allocate and register a new WireGuard net_device.
- * Returns the net_device pointer on success, ERR_PTR on failure.
- * The Rust side stores this and calls wg_destroy_device on cleanup.
- */
 struct net_device *wg_create_device(void *rust_priv)
 {
 	struct net_device *dev;
@@ -117,9 +114,6 @@ struct net_device *wg_create_device(void *rust_priv)
 }
 EXPORT_SYMBOL_GPL(wg_create_device);
 
-/*
- * Unregister and free a WireGuard net_device.
- */
 void wg_destroy_device(struct net_device *dev)
 {
 	if (!dev)
@@ -129,17 +123,24 @@ void wg_destroy_device(struct net_device *dev)
 }
 EXPORT_SYMBOL_GPL(wg_destroy_device);
 
-/*
- * Inject a decrypted packet into the kernel network stack.
- * Called by Rust after successful transport decryption.
- * Takes ownership of the skb.
- */
 void wg_net_rx(struct net_device *dev, struct sk_buff *skb)
 {
+	unsigned char ip_version;
+
 	skb->dev = dev;
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
-	skb->protocol = ip_tunnel_parse_protocol(skb);
 	skb_reset_network_header(skb);
+
+	/* Determine protocol from IP version nibble. */
+	if (skb->len >= 1) {
+		ip_version = skb->data[0] >> 4;
+		if (ip_version == 4)
+			skb->protocol = htons(ETH_P_IP);
+		else if (ip_version == 6)
+			skb->protocol = htons(ETH_P_IPV6);
+		else
+			skb->protocol = 0;
+	}
 
 	dev->stats.rx_packets++;
 	dev->stats.rx_bytes += skb->len;
@@ -148,20 +149,12 @@ void wg_net_rx(struct net_device *dev, struct sk_buff *skb)
 }
 EXPORT_SYMBOL_GPL(wg_net_rx);
 
-/*
- * Allocate an skb for outgoing encrypted data.
- * Returns NULL on allocation failure.
- */
 struct sk_buff *wg_alloc_skb(unsigned int len)
 {
 	return alloc_skb(len, GFP_ATOMIC);
 }
 EXPORT_SYMBOL_GPL(wg_alloc_skb);
 
-/*
- * Get the raw data pointer and length from an skb.
- * For reading the plaintext packet before encryption.
- */
 void wg_skb_data(struct sk_buff *skb, unsigned char **data, unsigned int *len)
 {
 	*data = skb->data;
@@ -169,18 +162,12 @@ void wg_skb_data(struct sk_buff *skb, unsigned char **data, unsigned int *len)
 }
 EXPORT_SYMBOL_GPL(wg_skb_data);
 
-/*
- * Free an skb (e.g., after we've consumed the plaintext).
- */
 void wg_kfree_skb(struct sk_buff *skb)
 {
 	kfree_skb(skb);
 }
 EXPORT_SYMBOL_GPL(wg_kfree_skb);
 
-/*
- * Update TX stats after successful encryption + send.
- */
 void wg_tx_stats(struct net_device *dev, unsigned int bytes)
 {
 	dev->stats.tx_packets++;
