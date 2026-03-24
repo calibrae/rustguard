@@ -3,7 +3,31 @@
 //! These values are from the WireGuard whitepaper, section 6.
 //! They define when to rekey, when to give up, and when to zero keys.
 
-use std::time::{Duration, Instant};
+use core::time::Duration;
+
+/// Monotonic timestamp abstraction — std::time::Instant on std, injectable on no_std.
+#[cfg(feature = "std")]
+type Timestamp = std::time::Instant;
+
+#[cfg(not(feature = "std"))]
+type Timestamp = u64; // nanoseconds from monotonic clock
+
+#[cfg(feature = "std")]
+fn now() -> Timestamp {
+    std::time::Instant::now()
+}
+
+#[cfg(feature = "std")]
+fn elapsed_since(ts: Timestamp) -> Duration {
+    ts.elapsed()
+}
+
+#[cfg(not(feature = "std"))]
+fn elapsed_since(_ts: Timestamp) -> Duration {
+    // Kernel callers must use the explicit check methods with their own clock.
+    // This fallback returns zero — the kernel module overrides timer logic.
+    Duration::ZERO
+}
 
 /// After this many seconds, initiate a new handshake.
 pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
@@ -32,13 +56,13 @@ pub const DEAD_SESSION_TIMEOUT: Duration = Duration::from_secs(240);
 /// Timer state for a peer's session lifecycle.
 pub struct SessionTimers {
     /// When the current session was established.
-    pub session_established: Option<Instant>,
+    pub session_established: Option<Timestamp>,
     /// When the last handshake initiation was sent.
-    pub last_handshake_sent: Option<Instant>,
+    pub last_handshake_sent: Option<Timestamp>,
     /// When we last received a valid authenticated packet.
-    pub last_received: Option<Instant>,
+    pub last_received: Option<Timestamp>,
     /// When we last sent a packet.
-    pub last_sent: Option<Instant>,
+    pub last_sent: Option<Timestamp>,
     /// Whether we've already initiated a rekey for the current session.
     pub rekey_requested: bool,
 }
@@ -55,21 +79,42 @@ impl SessionTimers {
     }
 
     /// Record that a new session was established.
+    #[cfg(feature = "std")]
     pub fn session_started(&mut self) {
-        let now = Instant::now();
+        let now = now();
         self.session_established = Some(now);
         self.last_received = Some(now);
         self.rekey_requested = false;
     }
 
+    /// Record that a new session was established (no_std: caller provides timestamp).
+    #[cfg(not(feature = "std"))]
+    pub fn session_started_at(&mut self, now_ns: u64) {
+        self.session_established = Some(now_ns);
+        self.last_received = Some(now_ns);
+        self.rekey_requested = false;
+    }
+
     /// Record that we sent a packet.
+    #[cfg(feature = "std")]
     pub fn packet_sent(&mut self) {
-        self.last_sent = Some(Instant::now());
+        self.last_sent = Some(now());
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn packet_sent_at(&mut self, now_ns: u64) {
+        self.last_sent = Some(now_ns);
     }
 
     /// Record that we received a valid packet.
+    #[cfg(feature = "std")]
     pub fn packet_received(&mut self) {
-        self.last_received = Some(Instant::now());
+        self.last_received = Some(now());
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn packet_received_at(&mut self, now_ns: u64) {
+        self.last_received = Some(now_ns);
     }
 
     /// Whether the session needs rekeying (time or message count).
@@ -81,7 +126,7 @@ impl SessionTimers {
             return true;
         }
         if let Some(established) = self.session_established {
-            return established.elapsed() >= REKEY_AFTER_TIME;
+            return elapsed_since(established) >= REKEY_AFTER_TIME;
         }
         false
     }
@@ -92,7 +137,7 @@ impl SessionTimers {
             return true;
         }
         if let Some(established) = self.session_established {
-            return established.elapsed() >= REJECT_AFTER_TIME;
+            return elapsed_since(established) >= REJECT_AFTER_TIME;
         }
         true // No session = expired.
     }
@@ -100,7 +145,7 @@ impl SessionTimers {
     /// Whether the session should be zeroed (dead).
     pub fn is_dead(&self) -> bool {
         if let Some(established) = self.session_established {
-            return established.elapsed() >= DEAD_SESSION_TIMEOUT;
+            return elapsed_since(established) >= DEAD_SESSION_TIMEOUT;
         }
         false
     }
@@ -116,8 +161,8 @@ impl SessionTimers {
         // within the keepalive interval.
         if let (Some(received), sent) = (self.last_received, self.last_sent) {
             let last_send_time = sent.unwrap_or(received);
-            return last_send_time.elapsed() >= interval
-                && received.elapsed() < interval;
+            return elapsed_since(last_send_time) >= interval
+                && elapsed_since(received) < interval;
         }
         false
     }
@@ -125,7 +170,7 @@ impl SessionTimers {
     /// Whether we should retry the handshake.
     pub fn should_retry_handshake(&self) -> bool {
         if let Some(last_sent) = self.last_handshake_sent {
-            return last_sent.elapsed() >= REKEY_TIMEOUT;
+            return elapsed_since(last_sent) >= REKEY_TIMEOUT;
         }
         true // Never sent a handshake, so yes.
     }
@@ -133,7 +178,7 @@ impl SessionTimers {
     /// Whether we should give up on the handshake.
     pub fn handshake_timed_out(&self) -> bool {
         if let Some(last_sent) = self.last_handshake_sent {
-            return last_sent.elapsed() >= REKEY_ATTEMPT_TIME;
+            return elapsed_since(last_sent) >= REKEY_ATTEMPT_TIME;
         }
         false
     }

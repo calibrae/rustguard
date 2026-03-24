@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use rustguard_crypto::{self as crypto};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 

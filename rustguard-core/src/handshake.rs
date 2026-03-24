@@ -8,6 +8,7 @@
 //! The chaining key (ck) and handshake hash (h) are threaded through
 //! every operation — this is the Noise pattern in action.
 
+use alloc::vec::Vec;
 use rustguard_crypto::{
     self as crypto, EphemeralSecret, PublicKey, SharedSecret, StaticSecret, Tai64n,
     CONSTRUCTION, IDENTIFIER, LABEL_MAC1,
@@ -79,15 +80,8 @@ pub struct InitiatorHandshake {
     psk: [u8; 32],
 }
 
-/// Create a handshake initiation message.
-///
-/// Arguments:
-///   - `our_static`: our long-lived identity key
-///   - `their_public`: responder's known public key
-///   - `sender_index`: our session index (random or sequential)
-///   - `psk`: pre-shared key (all zeros if not used)
-///
-/// Returns the initiation message and the state needed to process the response.
+/// Create a handshake initiation message (std convenience — uses OsRng and system clock).
+#[cfg(feature = "std")]
 pub fn create_initiation(
     our_static: &StaticSecret,
     their_public: &PublicKey,
@@ -96,12 +90,28 @@ pub fn create_initiation(
     create_initiation_psk(our_static, their_public, sender_index, &[0u8; 32])
 }
 
-/// Create a handshake initiation with an optional pre-shared key.
+/// Create a handshake initiation with PSK (std convenience).
+#[cfg(feature = "std")]
 pub fn create_initiation_psk(
     our_static: &StaticSecret,
     their_public: &PublicKey,
     sender_index: u32,
     psk: &[u8; 32],
+) -> (Initiation, InitiatorHandshake) {
+    let ephemeral = EphemeralSecret::random();
+    let timestamp = Tai64n::now();
+    create_initiation_with(our_static, their_public, sender_index, psk, ephemeral, timestamp)
+}
+
+/// Create a handshake initiation with explicit ephemeral key and timestamp.
+/// This is the core function — usable from both std and no_std.
+pub fn create_initiation_with(
+    our_static: &StaticSecret,
+    their_public: &PublicKey,
+    sender_index: u32,
+    psk: &[u8; 32],
+    ephemeral: EphemeralSecret,
+    timestamp: Tai64n,
 ) -> (Initiation, InitiatorHandshake) {
     let mut ck = initial_chain_key();
     let mut h = initial_hash(&ck);
@@ -109,8 +119,6 @@ pub fn create_initiation_psk(
     // Mix responder's public key into hash — both sides know this.
     h = mix_hash(&h, their_public.as_ref());
 
-    // Generate ephemeral keypair.
-    let ephemeral = EphemeralSecret::random();
     let eph_public = ephemeral.public_key();
 
     // Mix ephemeral public into hash.
@@ -132,7 +140,6 @@ pub fn create_initiation_psk(
     (ck, key2) = mix_key(&ck, &dh2);
 
     // Encrypt timestamp.
-    let timestamp = Tai64n::now();
     let encrypted_timestamp;
     (h, encrypted_timestamp) = encrypt_and_hash(&key2, &h, timestamp.as_bytes());
 
@@ -215,10 +222,8 @@ pub fn process_response(
 
 // ── Responder side ──────────────────────────────────────────────────
 
-/// Process a handshake initiation on the responder side.
-///
-/// Returns the initiator's public key (for peer lookup), the response message,
-/// and the transport session.
+/// Process a handshake initiation on the responder side (std convenience).
+#[cfg(feature = "std")]
 pub fn process_initiation(
     our_static: &StaticSecret,
     msg: &Initiation,
@@ -227,16 +232,27 @@ pub fn process_initiation(
     process_initiation_psk(our_static, msg, responder_index, &[0u8; 32], None)
 }
 
-/// Process a handshake initiation with an optional pre-shared key.
-///
-/// `last_timestamp`: if Some, the timestamp in the initiation must be strictly
-/// newer than this value. Pass None to skip replay check (first handshake).
+/// Process a handshake initiation with PSK (std convenience).
+#[cfg(feature = "std")]
 pub fn process_initiation_psk(
     our_static: &StaticSecret,
     msg: &Initiation,
     responder_index: u32,
     psk: &[u8; 32],
     last_timestamp: Option<&Tai64n>,
+) -> Option<(PublicKey, Tai64n, Response, TransportSession)> {
+    let resp_eph = EphemeralSecret::random();
+    process_initiation_with(our_static, msg, responder_index, psk, last_timestamp, resp_eph)
+}
+
+/// Process a handshake initiation with explicit ephemeral (no_std compatible).
+pub fn process_initiation_with(
+    our_static: &StaticSecret,
+    msg: &Initiation,
+    responder_index: u32,
+    psk: &[u8; 32],
+    last_timestamp: Option<&Tai64n>,
+    resp_eph: EphemeralSecret,
 ) -> Option<(PublicKey, Tai64n, Response, TransportSession)> {
     let our_public = our_static.public_key();
 
@@ -296,7 +312,6 @@ pub fn process_initiation_psk(
 
     // ── Build response ──
 
-    let resp_eph = EphemeralSecret::random();
     let resp_eph_public = resp_eph.public_key();
 
     // Mix responder ephemeral into hash.

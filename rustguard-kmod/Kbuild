@@ -1,0 +1,2 @@
+obj-m := rustguard.o
+rustguard-y := src/lib.o

@@ -4,3 +4,5 @@ Cargo.lock
 *.swo
 .DS_Store
 resume.sh
+rustguard-kmod/src/gen/
+inbox/

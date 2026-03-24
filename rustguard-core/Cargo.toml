@@ -5,11 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "WireGuard protocol core: Noise_IK handshake, transport, timers"
 
+[features]
+default = ["std"]
+std = ["rustguard-crypto/std", "getrandom"]
+
 [dependencies]
-rustguard-crypto = { path = "../rustguard-crypto" }
-getrandom = "0.2"
-subtle = "2"
-zeroize = { version = "1", features = ["derive"] }
+rustguard-crypto = { path = "../rustguard-crypto", default-features = false }
+getrandom = { version = "0.2", optional = true }
+subtle = { version = "2", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
 hex = "0.4"

@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit, Payload},
     ChaCha20Poly1305, Nonce, XChaCha20Poly1305, XNonce,

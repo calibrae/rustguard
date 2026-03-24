@@ -1,3 +1,4 @@
+#[cfg(feature = "std")]
 use std::time::SystemTime;
 
 /// TAI64N timestamp — 12 bytes: 8 bytes seconds (TAI64) + 4 bytes nanoseconds.
@@ -11,17 +12,22 @@ pub struct Tai64n([u8; 12]);
 const TAI64_EPOCH_OFFSET: u64 = 0x4000_0000_0000_000a;
 
 impl Tai64n {
-    /// Create a timestamp for "now".
+    /// Create a timestamp for "now" using the system clock.
+    #[cfg(feature = "std")]
     pub fn now() -> Self {
         let duration = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("system clock before UNIX epoch");
 
-        let secs = duration.as_secs() + TAI64_EPOCH_OFFSET;
-        let nanos = duration.subsec_nanos();
+        Self::from_unix(duration.as_secs(), duration.subsec_nanos())
+    }
 
+    /// Create a timestamp from UNIX seconds and nanoseconds.
+    /// Usable from both std and no_std contexts (kernel provides its own clock).
+    pub fn from_unix(secs: u64, nanos: u32) -> Self {
+        let tai_secs = secs + TAI64_EPOCH_OFFSET;
         let mut buf = [0u8; 12];
-        buf[..8].copy_from_slice(&secs.to_be_bytes());
+        buf[..8].copy_from_slice(&tai_secs.to_be_bytes());
         buf[8..].copy_from_slice(&nanos.to_be_bytes());
         Self(buf)
     }
@@ -57,6 +63,14 @@ mod tests {
     #[test]
     fn roundtrip() {
         let t = Tai64n::now();
+        let bytes = *t.as_bytes();
+        let restored = Tai64n::from_bytes(bytes);
+        assert_eq!(t, restored);
+    }
+
+    #[test]
+    fn from_unix_roundtrip() {
+        let t = Tai64n::from_unix(1700000000, 123456789);
         let bytes = *t.as_bytes();
         let restored = Tai64n::from_bytes(bytes);
         assert_eq!(t, restored);

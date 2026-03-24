@@ -1,4 +1,4 @@
-use rand_core::OsRng;
+use rand_core::CryptoRngCore;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -28,8 +28,15 @@ impl Eq for PublicKey {}
 pub struct SharedSecret([u8; 32]);
 
 impl StaticSecret {
+    /// Generate a random static key using the provided RNG.
+    pub fn random_from_rng(rng: &mut impl CryptoRngCore) -> Self {
+        Self(x25519_dalek::StaticSecret::random_from_rng(rng))
+    }
+
+    /// Generate a random static key using OS RNG.
+    #[cfg(feature = "std")]
     pub fn random() -> Self {
-        Self(x25519_dalek::StaticSecret::random_from_rng(OsRng))
+        Self(x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng))
     }
 
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -51,11 +58,18 @@ impl StaticSecret {
 }
 
 impl EphemeralSecret {
-    pub fn random() -> Self {
+    /// Generate a random ephemeral key using the provided RNG.
+    pub fn random_from_rng(rng: &mut impl CryptoRngCore) -> Self {
         // We use StaticSecret under the hood because x25519_dalek's
         // EphemeralSecret consumes itself on DH, which doesn't work
         // for WireGuard where we need the ephemeral for multiple DH ops.
-        Self(x25519_dalek::StaticSecret::random_from_rng(OsRng))
+        Self(x25519_dalek::StaticSecret::random_from_rng(rng))
+    }
+
+    /// Generate a random ephemeral key using OS RNG.
+    #[cfg(feature = "std")]
+    pub fn random() -> Self {
+        Self(x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng))
     }
 
     pub fn diffie_hellman(&self, their_public: &PublicKey) -> SharedSecret {
