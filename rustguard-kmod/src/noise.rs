@@ -9,8 +9,8 @@
 //! After this exchange both sides derive symmetric transport keys.
 //! All crypto calls go through the C shim (wg_crypto.c).
 
-use crate::{VoidPtr, AEAD_TAG_SIZE};
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::AEAD_TAG_SIZE;
+use core::sync::atomic::AtomicU64;
 
 // ── FFI ───────────────────────────────────────────────────────────────
 
