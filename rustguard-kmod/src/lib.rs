@@ -7,7 +7,7 @@
 
 use kernel::prelude::*;
 use kernel::alloc::KBox;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 module! {
     type: RustGuard,
@@ -72,7 +72,7 @@ struct Peer {
     key_send: [u8; 32],
     key_recv: [u8; 32],
     their_index: u32,
-    send_counter: u64,
+    send_counter: AtomicU64,
 }
 
 struct DeviceState {
@@ -156,7 +156,7 @@ impl kernel::Module for RustGuard {
                 key_send: ks,
                 key_recv: kr,
                 their_index: 42,
-                send_counter: 0,
+                send_counter: AtomicU64::new(0),
             };
 
             unsafe { (*state_raw).peer = Some(peer) };
@@ -232,7 +232,7 @@ unsafe fn do_xmit(skb: VoidPtr, priv_: VoidPtr) -> i32 {
             return 0;
         }
 
-        let counter = peer.send_counter;
+        let counter = peer.send_counter.fetch_add(1, Ordering::Relaxed);
         buf[0..4].copy_from_slice(&MSG_TRANSPORT.to_le_bytes());
         buf[4..8].copy_from_slice(&peer.their_index.to_le_bytes());
         buf[8..16].copy_from_slice(&counter.to_le_bytes());
