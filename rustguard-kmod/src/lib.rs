@@ -250,16 +250,22 @@ unsafe fn do_xmit(skb: VoidPtr, priv_: VoidPtr) -> i32 {
         wg_kfree_skb(skb);
 
         if ret != 0 {
+            pr_info!("rustguard: encrypt failed: {}\n", ret);
             return 0;
         }
 
-        wg_socket_send(
+        let send_ret = wg_socket_send(
             state.udp_sock,
             buf.as_ptr(),
             total_len as u32,
             peer.endpoint_ip,
             peer.endpoint_port,
         );
+
+        if counter < 3 {
+            pr_info!("rustguard: TX pkt #{} len={} enc_len={} send={}\n",
+                counter, data_len, total_len, send_ret);
+        }
 
         wg_tx_stats(state.net_dev, data_len);
 
@@ -330,7 +336,15 @@ unsafe fn do_rx(skb: VoidPtr, priv_: VoidPtr) -> i32 {
         wg_kfree_skb(skb);
 
         if ret != 0 {
+            if counter < 3 {
+                pr_info!("rustguard: RX decrypt failed: {} counter={} enc_len={}\n",
+                    ret, counter, encrypted_len);
+            }
             return 0;
+        }
+
+        if counter < 3 {
+            pr_info!("rustguard: RX pkt #{} dec_len={}\n", counter, encrypted_len - AEAD_TAG_SIZE);
         }
 
         let plaintext_len = encrypted_len - AEAD_TAG_SIZE;
