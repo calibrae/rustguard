@@ -1,64 +1,30 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * RustGuard — C shim for kernel crypto API.
+ * RustGuard — C shim for kernel crypto.
  *
- * Wraps the kernel's hardware-accelerated crypto primitives:
- *   - ChaCha20-Poly1305 AEAD (encrypt/decrypt transport packets)
- *   - BLAKE2s-256 hash (handshake, MAC, HKDF)
- *   - Curve25519 DH (key exchange)
+ * Uses the same chacha20poly1305 library functions as the real kernel
+ * WireGuard (lib/crypto/chacha20poly1305.c). No crypto API, no scatterlists,
+ * no TFM allocation. Just buffers in, buffers out.
  *
- * The kernel's ChaCha20 is hand-tuned ASM on x86 (AVX2/AVX-512),
- * which is why we're here instead of pure Rust.
+ * Jason got this right — the kernel crypto API is for block devices and TLS.
+ * WireGuard needs fast, simple, buffer-oriented crypto.
  */
 
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <crypto/aead.h>
-#include <crypto/hash.h>
-#include <linux/scatterlist.h>
 #include <linux/random.h>
+#include <crypto/chacha20poly1305.h>
 #include <crypto/blake2s.h>
-/*
- * Pre-allocated AEAD transform. Created once at module init,
- * reused for every encrypt/decrypt. Allocation on the hot path
- * was causing stalls — crypto_alloc_aead with GFP_ATOMIC fails
- * under load and is absurdly slow even when it succeeds.
- */
-static struct crypto_aead *wg_aead_tfm;
 
-int wg_crypto_init(void);
-void wg_crypto_exit(void);
-
-int wg_crypto_init(void)
-{
-	wg_aead_tfm = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
-	if (IS_ERR(wg_aead_tfm)) {
-		pr_err("rustguard: failed to alloc chacha20poly1305: %ld\n",
-		       PTR_ERR(wg_aead_tfm));
-		wg_aead_tfm = NULL;
-		return -ENOENT;
-	}
-	crypto_aead_setauthsize(wg_aead_tfm, 16);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(wg_crypto_init);
-
-void wg_crypto_exit(void)
-{
-	if (wg_aead_tfm) {
-		crypto_free_aead(wg_aead_tfm);
-		wg_aead_tfm = NULL;
-	}
-}
-EXPORT_SYMBOL_GPL(wg_crypto_exit);
-
-/* Prototypes for exported functions. */
+/* Prototypes. */
 int wg_chacha20poly1305_encrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
 	const u8 *ad, u32 ad_len, u8 *dst);
 int wg_chacha20poly1305_decrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
 	const u8 *ad, u32 ad_len, u8 *dst);
+int wg_crypto_init(void);
+void wg_crypto_exit(void);
 void wg_blake2s_256(const u8 *data, u32 data_len, u8 out[32]);
 void wg_blake2s_256_hmac(const u8 key[32], const u8 *data, u32 data_len, u8 out[32]);
 void wg_blake2s_256_mac(const u8 *key, u32 key_len,
@@ -68,47 +34,20 @@ void wg_hkdf(const u8 key[32], const u8 *input, u32 input_len,
 void wg_get_random_bytes(u8 *buf, u32 len);
 
 /*
- * ── ChaCha20-Poly1305 AEAD ───────────────────────────────────────────
+ * ── ChaCha20-Poly1305 ────────────────────────────────────────────────
  *
- * WireGuard transport: nonce = 4 zero bytes || 8-byte LE counter.
- * Returns 0 on success, negative on error.
+ * Direct library calls — same as kernel WireGuard uses.
+ * dst must have room for src_len + 16 (tag) on encrypt.
+ * src_len includes the 16-byte tag on decrypt.
  */
 
 int wg_chacha20poly1305_encrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
 	const u8 *ad, u32 ad_len, u8 *dst)
 {
-	struct aead_request *req;
-	struct scatterlist sg;
-	u8 iv[12];
-	int ret;
-
-	if (!wg_aead_tfm)
-		return -ENOENT;
-
-	ret = crypto_aead_setkey(wg_aead_tfm, key, 32);
-	if (ret)
-		return ret;
-
-	req = aead_request_alloc(wg_aead_tfm, GFP_ATOMIC);
-	if (!req)
-		return -ENOMEM;
-
-	memset(iv, 0, 4);
-	memcpy(iv + 4, &nonce, 8);
-
-	/* Copy src to dst — AEAD encrypts in-place, appends tag. */
-	memcpy(dst, src, src_len);
-
-	sg_init_one(&sg, dst, src_len + 16);
-
-	aead_request_set_crypt(req, &sg, &sg, src_len, iv);
-	aead_request_set_ad(req, 0);
-
-	ret = crypto_aead_encrypt(req);
-	aead_request_free(req);
-
-	return ret;
+	chacha20poly1305_encrypt(dst, src, src_len,
+				 ad, ad_len, nonce, key);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(wg_chacha20poly1305_encrypt);
 
@@ -116,38 +55,20 @@ int wg_chacha20poly1305_decrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
 	const u8 *ad, u32 ad_len, u8 *dst)
 {
-	struct aead_request *req;
-	struct scatterlist sg;
-	u8 iv[12];
-	int ret;
-
-	if (src_len < 16 || !wg_aead_tfm)
+	if (src_len < CHACHA20POLY1305_AUTHTAG_SIZE)
 		return -EINVAL;
-
-	ret = crypto_aead_setkey(wg_aead_tfm, key, 32);
-	if (ret)
-		return ret;
-
-	req = aead_request_alloc(wg_aead_tfm, GFP_ATOMIC);
-	if (!req)
-		return -ENOMEM;
-
-	memset(iv, 0, 4);
-	memcpy(iv + 4, &nonce, 8);
-
-	memcpy(dst, src, src_len);
-
-	sg_init_one(&sg, dst, src_len);
-
-	aead_request_set_crypt(req, &sg, &sg, src_len, iv);
-	aead_request_set_ad(req, 0);
-
-	ret = crypto_aead_decrypt(req);
-	aead_request_free(req);
-
-	return ret;
+	if (!chacha20poly1305_decrypt(dst, src, src_len,
+				      ad, ad_len, nonce, key))
+		return -EBADMSG;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(wg_chacha20poly1305_decrypt);
+
+int wg_crypto_init(void) { return 0; }
+EXPORT_SYMBOL_GPL(wg_crypto_init);
+
+void wg_crypto_exit(void) {}
+EXPORT_SYMBOL_GPL(wg_crypto_exit);
 
 /*
  * ── BLAKE2s-256 ───────────────────────────────────────────────────────
@@ -159,7 +80,6 @@ void wg_blake2s_256(const u8 *data, u32 data_len, u8 out[32])
 }
 EXPORT_SYMBOL_GPL(wg_blake2s_256);
 
-/* Keyed BLAKE2s MAC — used for MAC1/MAC2 in WireGuard. */
 void wg_blake2s_256_mac(const u8 *key, u32 key_len,
 	const u8 *data, u32 data_len, u8 out[32])
 {
@@ -167,10 +87,6 @@ void wg_blake2s_256_mac(const u8 *key, u32 key_len,
 }
 EXPORT_SYMBOL_GPL(wg_blake2s_256_mac);
 
-/*
- * HMAC-BLAKE2s — used in WireGuard's HKDF.
- * Standard HMAC construction: H((K ^ opad) || H((K ^ ipad) || msg))
- */
 void wg_blake2s_256_hmac(const u8 key[32], const u8 *data, u32 data_len, u8 out[32])
 {
 	struct blake2s_state state;
@@ -188,13 +104,11 @@ void wg_blake2s_256_hmac(const u8 key[32], const u8 *data, u32 data_len, u8 out[
 		opad[i] = padded_key[i] ^ 0x5c;
 	}
 
-	/* Inner: H(ipad || data) */
 	blake2s_init(&state, BLAKE2S_HASH_SIZE);
 	blake2s_update(&state, ipad, BLAKE2S_BLOCK_SIZE);
 	blake2s_update(&state, data, data_len);
 	blake2s_final(&state, inner_hash);
 
-	/* Outer: H(opad || inner_hash) */
 	blake2s_init(&state, BLAKE2S_HASH_SIZE);
 	blake2s_update(&state, opad, BLAKE2S_BLOCK_SIZE);
 	blake2s_update(&state, inner_hash, BLAKE2S_HASH_SIZE);
@@ -207,29 +121,21 @@ void wg_blake2s_256_hmac(const u8 key[32], const u8 *data, u32 data_len, u8 out[
 }
 EXPORT_SYMBOL_GPL(wg_blake2s_256_hmac);
 
-/*
- * HKDF using HMAC-BLAKE2s. Extracts + expands to 3 outputs.
- * out3 may be NULL if only 2 outputs are needed.
- */
 void wg_hkdf(const u8 key[32], const u8 *input, u32 input_len,
 	u8 out1[32], u8 out2[32], u8 out3[32])
 {
 	u8 prk[32];
-	u8 t_input[33]; /* 32 bytes previous T || 1 byte counter */
+	u8 t_input[33];
 
-	/* Extract: PRK = HMAC(key, input) */
 	wg_blake2s_256_hmac(key, input, input_len, prk);
 
-	/* Expand T1 = HMAC(PRK, 0x01) */
 	t_input[0] = 0x01;
 	wg_blake2s_256_hmac(prk, t_input, 1, out1);
 
-	/* Expand T2 = HMAC(PRK, T1 || 0x02) */
 	memcpy(t_input, out1, 32);
 	t_input[32] = 0x02;
 	wg_blake2s_256_hmac(prk, t_input, 33, out2);
 
-	/* Expand T3 = HMAC(PRK, T2 || 0x03) */
 	if (out3) {
 		memcpy(t_input, out2, 32);
 		t_input[32] = 0x03;
@@ -240,37 +146,6 @@ void wg_hkdf(const u8 key[32], const u8 *input, u32 input_len,
 	memzero_explicit(t_input, sizeof(t_input));
 }
 EXPORT_SYMBOL_GPL(wg_hkdf);
-
-/*
- * ── Curve25519 ────────────────────────────────────────────────────────
- * Disabled for now — requires CONFIG_CRYPTO_CURVE25519 which isn't in
- * defconfig. Only needed for handshake, not transport. Will enable when
- * we add the Noise_IK handshake to the kernel module.
- */
-#if 0
-int wg_curve25519(u8 out[32], const u8 scalar[32], const u8 point[32])
-{
-	return curve25519(out, scalar, point) ? 0 : -EINVAL;
-}
-EXPORT_SYMBOL_GPL(wg_curve25519);
-
-void wg_curve25519_generate_secret(u8 secret[32])
-{
-	curve25519_generate_secret(secret);
-}
-EXPORT_SYMBOL_GPL(wg_curve25519_generate_secret);
-
-void wg_curve25519_generate_public(u8 pub_key[32], const u8 secret[32])
-{
-	if (!curve25519_generate_public(pub_key, secret))
-		memset(pub_key, 0, 32);
-}
-EXPORT_SYMBOL_GPL(wg_curve25519_generate_public);
-#endif
-
-/*
- * ── Random ────────────────────────────────────────────────────────────
- */
 
 void wg_get_random_bytes(u8 *buf, u32 len)
 {
