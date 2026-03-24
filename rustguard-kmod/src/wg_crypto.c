@@ -271,7 +271,8 @@ EXPORT_SYMBOL_GPL(wg_curve25519_generate_secret);
 
 void wg_curve25519_generate_public(u8 pub_key[32], const u8 secret[32])
 {
-	curve25519_generate_public(pub_key, secret);
+	if (!curve25519_generate_public(pub_key, secret))
+		memset(pub_key, 0, 32);
 }
 EXPORT_SYMBOL_GPL(wg_curve25519_generate_public);
 
