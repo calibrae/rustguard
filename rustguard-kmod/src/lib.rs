@@ -42,6 +42,10 @@ extern "C" {
         ad: *const u8, ad_len: u32, dst: *mut u8,
     ) -> i32;
 
+    // wg_crypto.c lifecycle
+    fn wg_crypto_init() -> i32;
+    fn wg_crypto_exit();
+
     // wg_socket.c
     fn wg_socket_create(port: u16, rust_priv: VoidPtr) -> VoidPtr;
     fn wg_socket_destroy(sock: VoidPtr);
@@ -92,6 +96,13 @@ struct RustGuard;
 impl kernel::Module for RustGuard {
     fn init(_module: &'static ThisModule) -> Result<Self> {
         pr_info!("rustguard: initializing\n");
+
+        // Init crypto subsystem (pre-allocate AEAD transform).
+        let cret = unsafe { wg_crypto_init() };
+        if cret != 0 {
+            pr_err!("rustguard: crypto init failed: {}\n", cret);
+            return Err(ENOMEM);
+        }
 
         // Allocate state on the heap via kernel allocator.
         let state = DeviceState {
@@ -184,6 +195,7 @@ impl Drop for RustGuard {
                 cleanup_state(state_raw);
             }
         }
+        unsafe { wg_crypto_exit() };
         pr_info!("rustguard: unloaded\n");
     }
 }

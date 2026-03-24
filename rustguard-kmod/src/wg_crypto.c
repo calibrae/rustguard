@@ -18,6 +18,40 @@
 #include <linux/scatterlist.h>
 #include <linux/random.h>
 #include <crypto/blake2s.h>
+/*
+ * Pre-allocated AEAD transform. Created once at module init,
+ * reused for every encrypt/decrypt. Allocation on the hot path
+ * was causing stalls — crypto_alloc_aead with GFP_ATOMIC fails
+ * under load and is absurdly slow even when it succeeds.
+ */
+static struct crypto_aead *wg_aead_tfm;
+
+int wg_crypto_init(void);
+void wg_crypto_exit(void);
+
+int wg_crypto_init(void)
+{
+	wg_aead_tfm = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
+	if (IS_ERR(wg_aead_tfm)) {
+		pr_err("rustguard: failed to alloc chacha20poly1305: %ld\n",
+		       PTR_ERR(wg_aead_tfm));
+		wg_aead_tfm = NULL;
+		return -ENOENT;
+	}
+	crypto_aead_setauthsize(wg_aead_tfm, 16);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(wg_crypto_init);
+
+void wg_crypto_exit(void)
+{
+	if (wg_aead_tfm) {
+		crypto_free_aead(wg_aead_tfm);
+		wg_aead_tfm = NULL;
+	}
+}
+EXPORT_SYMBOL_GPL(wg_crypto_exit);
+
 /* Prototypes for exported functions. */
 int wg_chacha20poly1305_encrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
@@ -44,56 +78,36 @@ int wg_chacha20poly1305_encrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
 	const u8 *ad, u32 ad_len, u8 *dst)
 {
-	struct crypto_aead *tfm;
 	struct aead_request *req;
-	struct scatterlist sg_src, sg_dst;
+	struct scatterlist sg;
 	u8 iv[12];
 	int ret;
 
-	tfm = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
-	if (IS_ERR(tfm))
-		return PTR_ERR(tfm);
+	if (!wg_aead_tfm)
+		return -ENOENT;
 
-	ret = crypto_aead_setkey(tfm, key, 32);
+	ret = crypto_aead_setkey(wg_aead_tfm, key, 32);
 	if (ret)
-		goto out_free_tfm;
+		return ret;
 
-	crypto_aead_setauthsize(tfm, 16);
+	req = aead_request_alloc(wg_aead_tfm, GFP_ATOMIC);
+	if (!req)
+		return -ENOMEM;
 
-	req = aead_request_alloc(tfm, GFP_ATOMIC);
-	if (!req) {
-		ret = -ENOMEM;
-		goto out_free_tfm;
-	}
-
-	/* Build WireGuard nonce: 4 zero bytes || 8-byte LE counter */
 	memset(iv, 0, 4);
 	memcpy(iv + 4, &nonce, 8);
 
-	/* Copy src to dst first — AEAD encrypts in-place */
+	/* Copy src to dst — AEAD encrypts in-place, appends tag. */
 	memcpy(dst, src, src_len);
 
-	sg_init_one(&sg_src, dst, src_len + 16);
-	sg_init_one(&sg_dst, dst, src_len + 16);
+	sg_init_one(&sg, dst, src_len + 16);
 
-	aead_request_set_crypt(req, &sg_src, &sg_dst, src_len, iv);
-	aead_request_set_ad(req, ad_len);
-
-	/* If we have AD, we need a more complex SG setup */
-	if (ad_len > 0) {
-		struct scatterlist sg[2];
-		sg_init_table(sg, 2);
-		sg_set_buf(&sg[0], ad, ad_len);
-		sg_set_buf(&sg[1], dst, src_len + 16);
-		aead_request_set_crypt(req, sg, sg, src_len, iv);
-		aead_request_set_ad(req, ad_len);
-	}
+	aead_request_set_crypt(req, &sg, &sg, src_len, iv);
+	aead_request_set_ad(req, 0);
 
 	ret = crypto_aead_encrypt(req);
-
 	aead_request_free(req);
-out_free_tfm:
-	crypto_free_aead(tfm);
+
 	return ret;
 }
 EXPORT_SYMBOL_GPL(wg_chacha20poly1305_encrypt);
@@ -102,56 +116,35 @@ int wg_chacha20poly1305_decrypt(
 	const u8 key[32], u64 nonce, const u8 *src, u32 src_len,
 	const u8 *ad, u32 ad_len, u8 *dst)
 {
-	struct crypto_aead *tfm;
 	struct aead_request *req;
-	struct scatterlist sg_src, sg_dst;
+	struct scatterlist sg;
 	u8 iv[12];
 	int ret;
 
-	if (src_len < 16)
+	if (src_len < 16 || !wg_aead_tfm)
 		return -EINVAL;
 
-	tfm = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
-	if (IS_ERR(tfm))
-		return PTR_ERR(tfm);
-
-	ret = crypto_aead_setkey(tfm, key, 32);
+	ret = crypto_aead_setkey(wg_aead_tfm, key, 32);
 	if (ret)
-		goto out_free_tfm;
+		return ret;
 
-	crypto_aead_setauthsize(tfm, 16);
-
-	req = aead_request_alloc(tfm, GFP_ATOMIC);
-	if (!req) {
-		ret = -ENOMEM;
-		goto out_free_tfm;
-	}
+	req = aead_request_alloc(wg_aead_tfm, GFP_ATOMIC);
+	if (!req)
+		return -ENOMEM;
 
 	memset(iv, 0, 4);
 	memcpy(iv + 4, &nonce, 8);
 
 	memcpy(dst, src, src_len);
 
-	sg_init_one(&sg_src, dst, src_len);
-	sg_init_one(&sg_dst, dst, src_len);
+	sg_init_one(&sg, dst, src_len);
 
-	aead_request_set_crypt(req, &sg_src, &sg_dst, src_len, iv);
-	aead_request_set_ad(req, ad_len);
-
-	if (ad_len > 0) {
-		struct scatterlist sg[2];
-		sg_init_table(sg, 2);
-		sg_set_buf(&sg[0], ad, ad_len);
-		sg_set_buf(&sg[1], dst, src_len);
-		aead_request_set_crypt(req, sg, sg, src_len, iv);
-		aead_request_set_ad(req, ad_len);
-	}
+	aead_request_set_crypt(req, &sg, &sg, src_len, iv);
+	aead_request_set_ad(req, 0);
 
 	ret = crypto_aead_decrypt(req);
-
 	aead_request_free(req);
-out_free_tfm:
-	crypto_free_aead(tfm);
+
 	return ret;
 }
 EXPORT_SYMBOL_GPL(wg_chacha20poly1305_decrypt);
