@@ -40,6 +40,11 @@ static unsigned int role = 0;
 module_param(role, uint, 0644);
 MODULE_PARM_DESC(role, "0=initiator (send=key_a,recv=key_b), 1=responder (reversed)");
 
+/* Prototypes. */
+unsigned int wg_param_peer_ip(void);
+unsigned int wg_param_peer_port(void);
+unsigned int wg_param_role(void);
+
 /* Exported to Rust. */
 unsigned int wg_param_peer_ip(void) { return peer_ip; }
 EXPORT_SYMBOL_GPL(wg_param_peer_ip);
@@ -49,11 +54,6 @@ EXPORT_SYMBOL_GPL(wg_param_peer_port);
 
 unsigned int wg_param_role(void) { return role; }
 EXPORT_SYMBOL_GPL(wg_param_role);
-
-/* Prototypes. */
-unsigned int wg_param_peer_ip(void);
-unsigned int wg_param_peer_port(void);
-unsigned int wg_param_role(void);
 
 /* Prototypes for functions exported to Rust. */
 struct net_device *wg_create_device(void *rust_priv);
