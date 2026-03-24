@@ -8,7 +8,7 @@
 
 use kernel::prelude::*;
 use kernel::alloc::KBox;
-use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 module! {
     type: RustGuard,
@@ -421,29 +421,27 @@ unsafe fn handle_initiation(state: &mut DeviceState, pkt: &[u8], pkt_len: usize)
 
 /// Handle handshake response (type 2) — we are the initiator.
 unsafe fn handle_response(state: &mut DeviceState, pkt: &[u8], pkt_len: usize) {
-    unsafe {
-        if pkt_len < noise::RESPONSE_SIZE { return; }
+    if pkt_len < noise::RESPONSE_SIZE { return; }
 
-        let resp: &[u8; noise::RESPONSE_SIZE] =
-            pkt[..noise::RESPONSE_SIZE].try_into().unwrap_or(&[0u8; noise::RESPONSE_SIZE]);
+    let resp: &[u8; noise::RESPONSE_SIZE] =
+        pkt[..noise::RESPONSE_SIZE].try_into().unwrap_or(&[0u8; noise::RESPONSE_SIZE]);
 
-        // Take the pending handshake state.
-        let pending = match state.peer.as_mut().and_then(|p| p.pending_handshake.take()) {
-            Some(p) => p,
-            None => {
-                pr_info!("rustguard: unexpected handshake response\n");
-                return;
-            }
-        };
-
-        if let Some(keys) = noise::process_response(pending, &state.static_secret, resp) {
-            if let Some(ref mut peer) = state.peer {
-                peer.session = Some(keys);
-                pr_info!("rustguard: session established (initiator)\n");
-            }
-        } else {
-            pr_info!("rustguard: handshake response rejected\n");
+    // Take the pending handshake state.
+    let pending = match state.peer.as_mut().and_then(|p| p.pending_handshake.take()) {
+        Some(p) => p,
+        None => {
+            pr_info!("rustguard: unexpected handshake response\n");
+            return;
         }
+    };
+
+    if let Some(keys) = noise::process_response(pending, &state.static_secret, resp) {
+        if let Some(ref mut peer) = state.peer {
+            peer.session = Some(keys);
+            pr_info!("rustguard: session established (initiator)\n");
+        }
+    } else {
+        pr_info!("rustguard: handshake response rejected\n");
     }
 }
 
