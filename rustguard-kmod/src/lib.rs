@@ -18,6 +18,7 @@ module! {
     license: "GPL",
 }
 
+#[allow(dead_code)]
 mod noise;
 
 // ── FFI declarations ──────────────────────────────────────────────────
