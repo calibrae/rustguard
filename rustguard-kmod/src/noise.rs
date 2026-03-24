@@ -223,35 +223,35 @@ fn tai64n_now() -> [u8; 12] {
 // ── Wire format constants ─────────────────────────────────────────────
 
 /// Message type 1: Handshake Initiation (148 bytes).
-pub const MSG_INITIATION: u32 = 1;
+pub(crate) const MSG_INITIATION: u32 = 1;
 /// Message type 2: Handshake Response (92 bytes).
-pub const MSG_RESPONSE: u32 = 2;
+pub(crate) const MSG_RESPONSE: u32 = 2;
 /// Message type 4: Transport Data.
-pub const MSG_TRANSPORT: u32 = 4;
+pub(crate) const MSG_TRANSPORT: u32 = 4;
 
-pub const INITIATION_SIZE: usize = 148;
-pub const RESPONSE_SIZE: usize = 92;
+pub(crate) const INITIATION_SIZE: usize = 148;
+pub(crate) const RESPONSE_SIZE: usize = 92;
 
 // ── Transport session ─────────────────────────────────────────────────
 
 /// Derived transport keys from a completed handshake.
-pub struct TransportKeys {
+pub(crate) struct TransportKeys {
     /// Key for encrypting outgoing packets.
-    pub key_send: [u8; 32],
+    pub(crate) key_send: [u8; 32],
     /// Key for decrypting incoming packets.
-    pub key_recv: [u8; 32],
+    pub(crate) key_recv: [u8; 32],
     /// Our sender index.
-    pub our_index: u32,
+    pub(crate) our_index: u32,
     /// Their sender index.
-    pub their_index: u32,
+    pub(crate) their_index: u32,
     /// Outgoing nonce counter.
-    pub send_counter: AtomicU64,
+    pub(crate) send_counter: AtomicU64,
 }
 
 // ── Initiator handshake ───────────────────────────────────────────────
 
 /// State held between sending initiation and receiving response.
-pub struct InitiatorState {
+pub(crate) struct InitiatorState {
     ck: [u8; 32],
     h: [u8; 32],
     eph_secret: [u8; 32],
@@ -263,7 +263,7 @@ pub struct InitiatorState {
 /// Create a handshake initiation message (type 1).
 ///
 /// Returns the 148-byte wire message and the state needed to process the response.
-pub fn create_initiation(
+pub(crate) fn create_initiation(
     our_static_secret: &[u8; 32],
     our_static_public: &[u8; 32],
     their_public: &[u8; 32],
@@ -322,7 +322,7 @@ pub fn create_initiation(
 }
 
 /// Process a handshake response (type 2) and derive transport keys.
-pub fn process_response(
+pub(crate) fn process_response(
     state: InitiatorState,
     our_static_secret: &[u8; 32],
     resp: &[u8; RESPONSE_SIZE],
@@ -377,7 +377,7 @@ pub fn process_response(
 /// Process a handshake initiation (type 1) and generate a response (type 2).
 ///
 /// Returns: (initiator_public_key, response_message, transport_keys)
-pub fn process_initiation(
+pub(crate) fn process_initiation(
     our_static_secret: &[u8; 32],
     our_static_public: &[u8; 32],
     msg: &[u8; INITIATION_SIZE],
