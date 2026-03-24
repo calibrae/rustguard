@@ -1,20 +1,21 @@
 # RustGuard
 
-A clean-room WireGuard implementation in Rust. No libwg. Cross-platform. One small exception to "pure Rust": a 73-line BPF C program (`xdp_wg.c`) for the AF_XDP packet filter, pre-compiled to a 1.4KB `.o` and embedded via `include_bytes!`.
+A clean-room WireGuard implementation in Rust — userspace and kernel module. No libwg. Cross-platform userspace, Linux kernel module targeting 6.10+.
 
-**7,400 lines of Rust · 79 tests · 17 commits · 6 crates · 637KB static binary**
+**8,500+ lines of Rust · 80 tests · 7 crates · userspace + kernel module**
 
-Built as an experiment to understand WireGuard internals by implementing the full protocol from scratch, then pushing userspace performance as far as it can go on commodity hardware.
+Built as an experiment to understand WireGuard internals by implementing the full protocol from scratch, pushing userspace performance to its limits, then going in-kernel to eliminate the TUN bottleneck entirely.
 
 ## Architecture
 
 ```
-rustguard-crypto/     X25519, ChaCha20-Poly1305, HMAC-BLAKE2s, HKDF, TAI64N, XChaCha20
-rustguard-core/       Noise_IK handshake, transport sessions, replay window, timers, cookies
+rustguard-crypto/     X25519, ChaCha20-Poly1305, HMAC-BLAKE2s, HKDF, TAI64N (dual std/no_std)
+rustguard-core/       Noise_IK handshake, transport sessions, replay window, timers (dual std/no_std)
 rustguard-tun/        macOS utun, Linux TUN, multi-queue TUN, AF_XDP, io_uring, BPF loader
 rustguard-daemon/     Standard wg.conf tunnel mode (rustguard up)
 rustguard-enroll/     Zero-config enrollment, IP pool, Zigbee-style pairing, persistence
 rustguard-cli/        CLI: up, serve, join, open, close, status, genkey, pubkey
+rustguard-kmod/       Linux kernel module (Rust + C shim, out-of-tree, targets 6.10+)
 ```
 
 ## The Experiment — Commit by Commit
@@ -147,7 +148,27 @@ Replaced blocking `read()`/`write()` on TUN fds with io_uring. Pre-registered bu
 
 *Result: 225 Mbps.* Slower than multi-queue. At 30K packets/sec, the io_uring submission overhead exceeds the savings from batching. io_uring wins at higher packet rates (small packets, many flows) but loses to raw multi-queue for bulk throughput.
 
+### Phase 5: Kernel Module
+
+The userspace experiments proved TUN is the bottleneck. The only way to close the gap: stop leaving the kernel.
+
+**Commit 18-28 — Rust kernel module**
+
+Built an out-of-tree Linux kernel module in Rust targeting 6.10+:
+
+- **`no_std` refactor**: Made `rustguard-crypto` and `rustguard-core` dual `std`/`no_std` with feature flags. Handshake functions got `_with` variants that accept explicit RNG and timestamps instead of relying on `OsRng`/`SystemTime`.
+
+- **C shim architecture**: The kernel's Rust bindings (6.12) don't expose networking or crypto APIs. Solution: thin C shim files handle `net_device` registration (`wg_net.c`), crypto (`wg_crypto.c`), and UDP sockets (`wg_socket.c`). Rust handles the WireGuard protocol logic and packet routing.
+
+- **Crypto**: Uses the kernel's own `chacha20poly1305` library (same functions Jason uses in the C WireGuard module) — not the kernel crypto API. Direct buffer-oriented calls, no scatterlists, no TFM allocation on the hot path.
+
+- **Net device**: Registers `wg0` as a `POINTOPOINT | NOARP` interface with MTU 1420. `ndo_start_xmit` calls into Rust for encryption. UDP `encap_rcv` callback calls into Rust for decryption.
+
+- **The `skb_linearize` lesson**: Large packets (full MSS TCP segments) arrive in fragmented skbs. Reading `skb->data` only gets the linear portion. One line of `skb_linearize()` before decryption fixed the AEAD authentication failures that killed TCP bulk throughput.
+
 ### Performance Summary
+
+#### Userspace (Intel i225 2.5G NICs, PCIe passthrough, physical Ethernet)
 
 | Configuration | Throughput | % of Wire Speed |
 |---|---|---|
@@ -156,9 +177,18 @@ Replaced blocking `read()`/`write()` on TUN fds with io_uring. Pre-registered bu
 | **RustGuard (2 queues)** | **472 Mbps** | **20.0%** |
 | RustGuard (io_uring) | 225 Mbps | 9.6% |
 | RustGuard (single queue) | 175 Mbps | 7.4% |
-| RustGuard (AF_XDP) | ~175 Mbps | 7.4% |
 
-The kernel WireGuard implementation runs inside the network stack with zero-copy access to sk_buffs. A userspace implementation must cross the kernel boundary twice per packet (TUN read + TUN write). That's the fundamental tax. Multi-queue TUN parallelizes that tax across cores, which is the single biggest win available to userspace.
+#### Kernel Module (virtio-net VMs, same hypervisor)
+
+| Configuration | Throughput | % of Wire Speed |
+|---|---|---|
+| Bare wire (virtio-net) | 33,100 Mbps | 100% |
+| Kernel WireGuard (C) | 4,190 Mbps | 12.7% |
+| **RustGuard kmod** | **1,180 Mbps** | **3.6%** |
+
+The kernel module is a first pass — single-threaded, memcpy to stack buffers, no parallel crypto. Kernel WireGuard has parallel per-CPU crypto workqueues, zero-copy skb manipulation, and 10 years of optimization. The 3.5x gap is entirely engineering, not architecture. The known fixes: encrypt directly in skb scatter-gather (eliminate double memcpy), parallel crypto workqueue, NAPI-based receive.
+
+The fundamental result: **going from userspace (TUN) to kernel (net_device) gave a 2.5x throughput improvement** — from 472 Mbps to 1,180 Mbps — confirming that TUN was always the bottleneck.
 
 ## Usage
 
@@ -220,17 +250,21 @@ The release profile strips symbols, enables LTO, and optimizes for size (`opt-le
 
 ## What I Learned
 
-1. **TUN is the bottleneck, not crypto.** ChaCha20-Poly1305 runs at >10 Gbps on modern CPUs. The kernel boundary crossing for TUN read/write is what kills userspace VPN throughput.
+1. **TUN is the bottleneck, not crypto.** ChaCha20-Poly1305 runs at >10 Gbps on modern CPUs. The kernel boundary crossing for TUN read/write is what kills userspace VPN throughput. Proved it by going in-kernel: 472 Mbps → 1,180 Mbps.
 
-2. **Multi-queue TUN is the biggest win.** Parallelizing TUN I/O across cores gave a 2.7× improvement. Everything else (AF_XDP, io_uring, recvmmsg) was noise in comparison.
+2. **Multi-queue TUN is the biggest userspace win.** Parallelizing TUN I/O across cores gave a 2.7× improvement. Everything else (AF_XDP, io_uring, recvmmsg) was noise in comparison.
 
-3. **AF_XDP solves the wrong problem.** Zero-copy UDP is fast, but the bottleneck is on the TUN side. AF_XDP would matter if both sides were AF_XDP (no TUN at all), but then you're building a kernel module with extra steps.
+3. **AF_XDP solves the wrong problem.** Zero-copy UDP is fast, but the bottleneck is on the TUN side. AF_XDP would matter if both sides were AF_XDP (no TUN at all), but then you're building a kernel module with extra steps. Which is what we ended up doing.
 
-4. **io_uring has overhead at low packet rates.** At bulk-transfer packet rates (~30K pps), the submission queue management overhead exceeds the savings from batching. io_uring wins at higher packet rates with small packets.
+4. **Rust in the kernel works, but you're on your own for networking.** Kernel 6.12 Rust bindings only cover block devices and PHY drivers. For networking, you write C shim functions and call them from Rust via FFI. Not elegant, but it works.
 
-5. **The WireGuard protocol is beautifully simple.** Noise_IK, 1-RTT handshake, 64-bit nonce counter, rotating keys. Jason Donenfeld's 4,000 lines of kernel code is an achievement in discipline. Building it from scratch is the best way to appreciate that.
+5. **Jason's chacha20poly1305 library is the right abstraction.** The kernel crypto API (`crypto_alloc_aead`, scatterlists, requests) is designed for block devices and TLS. WireGuard needs buffer-in, buffer-out. Jason wrote `lib/crypto/chacha20poly1305.c` for exactly this reason. We wasted time on the crypto API before finding this.
 
-6. **Security audits find real bugs.** The HMAC-BLAKE2s implementation was wrong (keyed BLAKE2s ≠ HMAC). MAC1 was checked too late. The replay window was updatable before AEAD verification. None of these showed up in functional tests.
+6. **`skb_linearize` is the kernel networking rite of passage.** Large packets arrive in fragmented skbs. Reading `skb->data` only gives you the linear head. Your AEAD will fail with `EBADMSG` and you'll stare at it for an hour before realizing the data isn't contiguous. Every kernel network developer has this story.
+
+7. **The WireGuard protocol is beautifully simple.** Noise_IK, 1-RTT handshake, 64-bit nonce counter, rotating keys. Jason Donenfeld's 4,000 lines of kernel code is an achievement in discipline. Building it from scratch is the best way to appreciate that.
+
+8. **Security audits find real bugs.** The HMAC-BLAKE2s implementation was wrong (keyed BLAKE2s ≠ HMAC). MAC1 was checked too late. The replay window was updatable before AEAD verification. None of these showed up in functional tests.
 
 ## License
 
