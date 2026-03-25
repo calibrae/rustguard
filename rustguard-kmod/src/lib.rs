@@ -745,11 +745,7 @@ unsafe fn handle_transport(
             peer.endpoint_port = src_port;
         }
 
-        // Inject plaintext — use GFP_KERNEL alloc from workqueue if async,
-        // GFP_ATOMIC inline if sync.
         let plaintext_len = encrypted_len - AEAD_TAG_SIZE;
-        let gfp_flags = if wg_param_async_crypto() != 0 { 0x0cc0u32 } else { 0x0020u32 };
-        // Both paths: alloc skb, copy plaintext, inject.
         let new_skb = wg_alloc_skb(plaintext_len as u32);
         if new_skb.is_null() { return; }
         let dest = skb_put(new_skb, plaintext_len as u32);
