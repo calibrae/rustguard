@@ -230,19 +230,24 @@ rustguard serve --pool 10.150.0.0/24 --token s --uring          # io_uring batch
 
 ## Footprint
 
-**8,551 lines of Rust** across 7 crates + **596 lines of C** kernel shims. 46 commits.
+**9,300+ lines of Rust** across 7 crates + **751 lines of C** kernel shims.
 
-Kernel module breakdown (1,601 lines total):
+Kernel module breakdown (2,499 lines total):
 
 | File | Lines | Role |
 |------|-------|------|
-| `noise.rs` | 485 | Noise_IK handshake, Curve25519 DH, BLAKE2s HKDF, key derivation |
-| `lib.rs` | 520 | Module init, device state, TX/RX packet paths, peer management |
-| `wg_net.c` | 231 | net_device registration, skb helpers, module params |
-| `wg_crypto.c` | 214 | ChaCha20-Poly1305, BLAKE2s, HKDF, Curve25519 (kernel lib wrappers) |
+| `lib.rs` | 602 | Module init, TX/RX paths, peer management, multi-peer state |
+| `noise.rs` | 481 | Full Noise_IK handshake, Curve25519 DH, BLAKE2s HKDF |
+| `allowedips.rs` | 211 | IPv4/IPv6 radix trie for cryptokey routing |
+| `cookie.rs` | 206 | DoS protection: MAC1/MAC2 verification, cookie reply |
+| `timers.rs` | 156 | Session timers: rekey, keepalive, expiry state machine |
+| `replay.rs` | 92 | Anti-replay 2048-bit sliding window |
+| `wg_net.c` | 231 | net_device registration, module params, skb helpers |
+| `wg_crypto.c` | 229 | Kernel crypto library wrappers + time functions |
 | `wg_socket.c` | 151 | Kernel UDP socket, encap_rcv callback |
+| `wg_genl.c` | 140 | Genetlink skeleton for `wg` tool compatibility |
 
-63% Rust, 37% C. The C is pure plumbing (kernel APIs without Rust bindings). The protocol logic, state machine, and packet handling are all Rust. For reference, kernel WireGuard is ~4,000 lines of C.
+70% Rust, 30% C. The C is pure plumbing (kernel APIs without Rust bindings yet). All protocol logic — handshake, routing, replay, timers, cookies — is Rust. For reference, kernel WireGuard is ~4,000 lines of C; we're at 2,499 (62%) with full protocol coverage.
 
 ## Building
 
