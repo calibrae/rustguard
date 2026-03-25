@@ -242,32 +242,25 @@ struct sk_buff *wg_decrypt_skb_full(struct sk_buff *skb, u32 hdr_len,
 
 	ct_len = skb->len - hdr_len;
 
-	/* Make a writable linear copy. skb_copy guarantees:
-	 * - Linear (no frags, data_len == 0)
-	 * - Exclusive (refcount == 1, not cloned)
-	 * - All data in skb->data[0..skb->len]
-	 */
-	nskb = skb_copy(skb, GFP_ATOMIC);
-	if (!nskb)
-		return NULL;
+	{
+		/* Decrypt to a fresh buffer, then build a clean skb.
+		 * This avoids ALL skb manipulation issues — the input skb
+		 * is only read, the output skb is freshly allocated. */
+		u8 *ct_data = skb->data + hdr_len;
+		u32 pt_len = ct_len - CHACHA20POLY1305_AUTHTAG_SIZE;
 
-	/* Pull the WireGuard header so data starts at ciphertext. */
-	skb_pull(nskb, hdr_len);
+		nskb = alloc_skb(pt_len, GFP_ATOMIC);
+		if (!nskb)
+			return NULL;
 
-	/* Use the non-SG buffer-based decrypt directly on the linear data.
-	 * chacha20poly1305_decrypt handles page mapping internally.
-	 * sg_init_one + decrypt_sg_inplace crashes on skb_copy data
-	 * (possibly vmalloc'd for large allocations). */
-	if (!chacha20poly1305_decrypt(nskb->data, nskb->data, ct_len,
-				      NULL, 0, nonce, key)) {
-		kfree_skb(nskb);
-		return NULL;
+		if (!chacha20poly1305_decrypt(skb_put(nskb, pt_len), ct_data,
+					      ct_len, NULL, 0, nonce, key)) {
+			kfree_skb(nskb);
+			return NULL;
+		}
+
+		return nskb;
 	}
-
-	/* Trim the AEAD tag. */
-	skb_trim(nskb, ct_len - CHACHA20POLY1305_AUTHTAG_SIZE);
-
-	return nskb;
 }
 EXPORT_SYMBOL_GPL(wg_decrypt_skb_full);
 
