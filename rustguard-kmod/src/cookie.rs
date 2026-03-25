@@ -33,7 +33,7 @@ extern "C" {
         ad: *const u8, ad_len: u32, dst: *mut u8,
     ) -> i32;
     fn wg_get_random_bytes(buf: *mut u8, len: u32);
-    fn wg_wg_ktime_get_ns() -> u64;
+    fn wg_ktime_get_ns() -> u64;
 }
 
 fn hash(chunks: &[&[u8]]) -> [u8; 32] {
