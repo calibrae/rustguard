@@ -274,7 +274,7 @@ pub(crate) struct InitiatorState {
     ck: [u8; 32],
     h: [u8; 32],
     eph_secret: [u8; 32],
-    sender_index: u32,
+    pub(crate) sender_index: u32,
     their_public: [u8; 32],
     psk: [u8; 32],
 }

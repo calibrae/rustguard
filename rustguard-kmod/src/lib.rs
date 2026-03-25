@@ -56,6 +56,10 @@ extern "C" {
     // wg_genl.c
     fn wg_genl_init() -> i32;
     fn wg_genl_exit();
+
+    // wg_timer.c
+    fn wg_timer_start(rust_priv: VoidPtr) -> i32;
+    fn wg_timer_stop();
     fn wg_curve25519_generate_secret(secret: *mut u8);
     fn wg_curve25519_generate_public(pub_key: *mut u8, secret: *const u8);
     fn wg_get_random_bytes(buf: *mut u8, len: u32);
@@ -98,6 +102,8 @@ struct Peer {
     psk: [u8; 32],
     /// Active transport session (set after handshake completes).
     session: Option<noise::TransportKeys>,
+    /// Previous session — kept alive during rekeying so in-flight packets decrypt.
+    prev_session: Option<noise::TransportKeys>,
     /// Pending initiator handshake state (between sending init and receiving response).
     pending_handshake: Option<noise::InitiatorState>,
     /// Anti-replay window for incoming packets.
@@ -233,6 +239,7 @@ impl kernel::Module for RustGuard {
                 endpoint_port: pport,
                 psk: [0u8; 32],
                 session: None,
+                prev_session: None,
                 pending_handshake: None,
                 replay_window: replay::ReplayWindow::new(),
                 timers: timers::SessionTimers::new(),
@@ -289,6 +296,9 @@ impl kernel::Module for RustGuard {
             }
         }
 
+        // Start periodic timer for rekeying + keepalives.
+        unsafe { wg_timer_start(state_raw as VoidPtr) };
+
         pr_info!("rustguard: wg0 created, listening on UDP 51820\n");
         Ok(RustGuard)
     }
@@ -296,6 +306,8 @@ impl kernel::Module for RustGuard {
 
 impl Drop for RustGuard {
     fn drop(&mut self) {
+        // Stop timer before tearing down state.
+        unsafe { wg_timer_stop() };
         let state_raw = DEVICE_STATE_PTR.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !state_raw.is_null() {
             unsafe {
@@ -411,6 +423,10 @@ unsafe fn do_xmit(skb: VoidPtr, priv_: VoidPtr) -> i32 {
         );
         wg_tx_stats(state.net_dev, data_len);
 
+        // Update timer (can't mutate peer from TX path, but packet_sent
+        // only writes a timestamp — acceptable race with timer tick).
+        // peer.timers.packet_sent(); // TODO: needs mutable access
+
         0
     }
 }
@@ -497,8 +513,23 @@ unsafe fn handle_initiation(
         );
 
         if let Some((initiator_public, timestamp, resp, keys)) = result {
+            // Find peer by public key, or use first empty slot.
+            let mut target_idx: Option<usize> = None;
+            for i in 0..(*state).peer_count {
+                if let Some(ref p) = (*state).peers[i] {
+                    if p.public_key == initiator_public || p.public_key == [0u8; 32] {
+                        target_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+            let peer_idx = match target_idx {
+                Some(i) => i,
+                None => return,
+            };
+
             // H3: Timestamp replay protection.
-            if let Some(ref peer) = (*state).peers[0] {
+            if let Some(ref peer) = (*state).peers[peer_idx] {
                 if peer.last_timestamp != [0u8; 12] && timestamp <= peer.last_timestamp {
                     return;
                 }
@@ -508,8 +539,7 @@ unsafe fn handle_initiation(
                 initiator_public[0], initiator_public[1],
                 initiator_public[2], initiator_public[3]);
 
-            // Send response to the ACTUAL source address, not the preconfigured endpoint.
-            // This is how WireGuard handles NAT traversal and roaming.
+            // Send response to actual source (NAT traversal).
             wg_socket_send(
                 (*state).udp_sock,
                 resp.as_ptr(), noise::RESPONSE_SIZE as u32,
@@ -517,13 +547,14 @@ unsafe fn handle_initiation(
             );
 
             let idx_slot = (keys.our_index as usize) & 0xFFFF;
-            (*state).index_map[idx_slot] = Some(0);
+            (*state).index_map[idx_slot] = Some(peer_idx);
 
-            if let Some(ref mut peer) = (*state).peers[0] {
+            if let Some(ref mut peer) = (*state).peers[peer_idx] {
                 peer.public_key = initiator_public;
-                // Update endpoint to where the packet came from (roaming).
                 peer.endpoint_ip = src_ip;
                 peer.endpoint_port = src_port;
+                // Rotate sessions: current → previous.
+                peer.prev_session = peer.session.take();
                 peer.session = Some(keys);
                 peer.replay_window = replay::ReplayWindow::new();
                 peer.timers.session_started();
@@ -546,27 +577,36 @@ unsafe fn handle_response(
         let resp: &[u8; noise::RESPONSE_SIZE] =
             pkt[..noise::RESPONSE_SIZE].try_into().unwrap_or(&[0u8; noise::RESPONSE_SIZE]);
 
-        // Peek at pending state — don't consume it until validation passes.
-        // If process_response fails (MAC1, DH), we want to keep the state
-        // so a retransmitted response can be processed.
-        let has_pending = (*state).peers[0]
-            .as_ref()
-            .map(|p| p.pending_handshake.is_some())
-            .unwrap_or(false);
-        if !has_pending { return; }
+        // Find the peer with a pending handshake matching this response's receiver_index.
+        let resp_receiver = u32::from_le_bytes(
+            resp[8..12].try_into().unwrap_or([0; 4])
+        );
+        let mut peer_idx: Option<usize> = None;
+        for i in 0..(*state).peer_count {
+            if let Some(ref p) = (*state).peers[i] {
+                if let Some(ref hs) = p.pending_handshake {
+                    if hs.sender_index == resp_receiver {
+                        peer_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+        let pidx = match peer_idx {
+            Some(i) => i,
+            None => return,
+        };
 
-        // Now take it — process_response will validate MAC1 and DH.
-        // If it fails, the handshake state is consumed (initiator must retry).
-        let pending = (*state).peers[0].as_mut().unwrap().pending_handshake.take().unwrap();
+        let pending = (*state).peers[pidx].as_mut().unwrap().pending_handshake.take().unwrap();
 
         if let Some(keys) = noise::process_response(pending, &(*state).static_secret, resp) {
             let idx_slot = (keys.our_index as usize) & 0xFFFF;
-            (*state).index_map[idx_slot] = Some(0);
+            (*state).index_map[idx_slot] = Some(pidx);
 
-            if let Some(ref mut peer) = (*state).peers[0] {
-                // Update endpoint to actual source (roaming).
+            if let Some(ref mut peer) = (*state).peers[pidx] {
                 peer.endpoint_ip = src_ip;
                 peer.endpoint_port = src_port;
+                peer.prev_session = peer.session.take();
                 peer.session = Some(keys);
                 peer.replay_window = replay::ReplayWindow::new();
                 peer.timers.session_started();
@@ -601,17 +641,11 @@ unsafe fn handle_transport(
             Some(p) => p,
             None => { wg_kfree_skb(skb); return; }
         };
-        let session = match &peer.session {
-            Some(s) => s,
-            None => { wg_kfree_skb(skb); return; }
-        };
-
         let counter = u64::from_le_bytes([
             pkt[8], pkt[9], pkt[10], pkt[11],
             pkt[12], pkt[13], pkt[14], pkt[15],
         ]);
 
-        // Replay check BEFORE decryption (cheap).
         if !peer.replay_window.check(counter) {
             wg_kfree_skb(skb);
             return;
@@ -626,19 +660,35 @@ unsafe fn handle_transport(
             return;
         }
 
-        let ret = wg_chacha20poly1305_decrypt(
-            session.key_recv.as_ptr(), counter,
-            encrypted.as_ptr(), encrypted_len as u32,
-            core::ptr::null(), 0,
-            plaintext_buf.as_mut_ptr(),
-        );
+        // Try current session first, then previous (handles in-flight during rekey).
+        let mut decrypted = false;
+        if let Some(ref session) = peer.session {
+            let ret = wg_chacha20poly1305_decrypt(
+                session.key_recv.as_ptr(), counter,
+                encrypted.as_ptr(), encrypted_len as u32,
+                core::ptr::null(), 0,
+                plaintext_buf.as_mut_ptr(),
+            );
+            if ret == 0 { decrypted = true; }
+        }
+        if !decrypted {
+            if let Some(ref prev) = peer.prev_session {
+                let ret = wg_chacha20poly1305_decrypt(
+                    prev.key_recv.as_ptr(), counter,
+                    encrypted.as_ptr(), encrypted_len as u32,
+                    core::ptr::null(), 0,
+                    plaintext_buf.as_mut_ptr(),
+                );
+                if ret == 0 { decrypted = true; }
+            }
+        }
 
         wg_kfree_skb(skb);
 
-        if ret != 0 { return; }
+        if !decrypted { return; }
 
-        // Update replay window AFTER successful AEAD verification.
         peer.replay_window.update(counter);
+        peer.timers.packet_received();
 
         // Roaming: update endpoint on authenticated data.
         // Only change if the source actually differs (avoid cache line dirtying).
@@ -662,6 +712,123 @@ unsafe fn handle_transport(
 /// Device teardown callback.
 #[no_mangle]
 pub extern "C" fn rustguard_dev_uninit(_priv: VoidPtr) {}
+
+/// Periodic timer callback (every 250ms) — check rekeying and keepalives.
+#[no_mangle]
+pub extern "C" fn rustguard_timer_tick(priv_: VoidPtr) {
+    unsafe { do_timer_tick(priv_) }
+}
+
+unsafe fn do_timer_tick(priv_: VoidPtr) {
+    unsafe {
+        let state = priv_ as *mut DeviceState;
+
+        for peer_idx in 0..(*state).peer_count {
+            let peer = match &mut (*state).peers[peer_idx] {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let session = match &peer.session {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let counter = session.send_counter.load(Ordering::Relaxed);
+
+            // Dead session — zero keys.
+            if peer.timers.is_dead() {
+                if let Some(ref mut s) = peer.session {
+                    noise::zeroize(&mut s.key_send);
+                    noise::zeroize(&mut s.key_recv);
+                }
+                peer.session = None;
+                peer.prev_session = None;
+                continue;
+            }
+
+            // Needs rekey — initiate new handshake.
+            if peer.timers.needs_rekey(counter) && peer.pending_handshake.is_none() {
+                initiate_rekey(state, peer_idx);
+            }
+
+            // Keepalive — send empty transport packet.
+            if peer.timers.needs_keepalive() {
+                send_keepalive(state, peer_idx);
+            }
+        }
+    }
+}
+
+/// Initiate a rekey handshake for a peer.
+unsafe fn initiate_rekey(state: *mut DeviceState, peer_idx: usize) {
+    unsafe {
+        let peer = match &mut (*state).peers[peer_idx] {
+            Some(p) => p,
+            None => return,
+        };
+
+        if peer.public_key == [0u8; 32] { return; }
+
+        let mut idx_bytes = [0u8; 4];
+        wg_get_random_bytes(idx_bytes.as_mut_ptr(), 4);
+        let sender_index = u32::from_le_bytes(idx_bytes);
+
+        if let Some((init_msg, hs_state)) = noise::create_initiation(
+            &(*state).static_secret,
+            &(*state).static_public,
+            &peer.public_key,
+            sender_index,
+            &peer.psk,
+        ) {
+            wg_socket_send(
+                (*state).udp_sock,
+                init_msg.as_ptr(),
+                noise::INITIATION_SIZE as u32,
+                peer.endpoint_ip, peer.endpoint_port,
+            );
+            peer.pending_handshake = Some(hs_state);
+            peer.timers.handshake_sent();
+        }
+    }
+}
+
+/// Send an empty keepalive transport packet.
+unsafe fn send_keepalive(state: *mut DeviceState, peer_idx: usize) {
+    unsafe {
+        let peer = match &(*state).peers[peer_idx] {
+            Some(p) => p,
+            None => return,
+        };
+        let session = match &peer.session {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Empty transport: header + AEAD tag over zero-length plaintext.
+        let mut buf = [0u8; WG_HEADER_SIZE + AEAD_TAG_SIZE];
+        let counter = session.send_counter.fetch_add(1, Ordering::Relaxed);
+        buf[0..4].copy_from_slice(&noise::MSG_TRANSPORT.to_le_bytes());
+        buf[4..8].copy_from_slice(&session.their_index.to_le_bytes());
+        buf[8..16].copy_from_slice(&counter.to_le_bytes());
+
+        wg_chacha20poly1305_encrypt(
+            session.key_send.as_ptr(), counter,
+            core::ptr::null(), 0, // empty plaintext
+            core::ptr::null(), 0,
+            buf.as_mut_ptr().add(WG_HEADER_SIZE),
+        );
+
+        wg_socket_send(
+            (*state).udp_sock,
+            buf.as_ptr(),
+            (WG_HEADER_SIZE + AEAD_TAG_SIZE) as u32,
+            peer.endpoint_ip, peer.endpoint_port,
+        );
+
+        peer.timers.packet_sent();
+    }
+}
 
 /// Genetlink GET callback (stub — returns device info).
 #[no_mangle]
