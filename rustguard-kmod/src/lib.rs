@@ -691,30 +691,35 @@ unsafe fn handle_transport(
             return;
         }
 
-        let ct_len = (pkt_len - WG_HEADER_SIZE) as u32;
+        let encrypted = &pkt[WG_HEADER_SIZE..];
+        let encrypted_len = encrypted.len();
 
-        // Zero-copy in-place decrypt. The skb is guaranteed writable
-        // by pskb_expand_head in the socket shim.
-        let mut decrypted = false;
-        if let Some(ref session) = peer.session {
-            if wg_decrypt_skb(skb, WG_HEADER_SIZE as u32, ct_len,
-                              counter, session.key_recv.as_ptr()) == 0 {
-                decrypted = true;
-            }
-        }
-        if !decrypted {
-            if let Some(ref prev) = peer.prev_session {
-                if wg_decrypt_skb(skb, WG_HEADER_SIZE as u32, ct_len,
-                                  counter, prev.key_recv.as_ptr()) == 0 {
-                    decrypted = true;
-                }
-            }
-        }
-
-        if !decrypted {
+        let mut plaintext_buf = [0u8; 2048];
+        if encrypted_len > plaintext_buf.len() {
             wg_kfree_skb(skb);
             return;
         }
+
+        let mut decrypted = false;
+        if let Some(ref session) = peer.session {
+            if wg_chacha20poly1305_decrypt(
+                session.key_recv.as_ptr(), counter,
+                encrypted.as_ptr(), encrypted_len as u32,
+                core::ptr::null(), 0, plaintext_buf.as_mut_ptr(),
+            ) == 0 { decrypted = true; }
+        }
+        if !decrypted {
+            if let Some(ref prev) = peer.prev_session {
+                if wg_chacha20poly1305_decrypt(
+                    prev.key_recv.as_ptr(), counter,
+                    encrypted.as_ptr(), encrypted_len as u32,
+                    core::ptr::null(), 0, plaintext_buf.as_mut_ptr(),
+                ) == 0 { decrypted = true; }
+            }
+        }
+
+        wg_kfree_skb(skb);
+        if !decrypted { return; }
 
         peer.replay_window.update(counter);
         peer.timers.packet_received();
@@ -724,18 +729,12 @@ unsafe fn handle_transport(
             peer.endpoint_port = src_port;
         }
 
-        let plaintext_len = ct_len as usize - AEAD_TAG_SIZE;
-
-        // Strip WG header from front, trim AEAD tag from end.
-        extern "C" {
-            fn wg_skb_pull(skb: VoidPtr, len: u32);
-            fn wg_skb_trim(skb: VoidPtr, len: u32);
-        }
-        wg_skb_pull(skb, WG_HEADER_SIZE as u32);
-        wg_skb_trim(skb, plaintext_len as u32);
-
-        // Inject into kernel stack. Ownership transfers to netif_rx.
-        wg_net_rx((*state).net_dev, skb);
+        let plaintext_len = encrypted_len - AEAD_TAG_SIZE;
+        let new_skb = wg_alloc_skb(plaintext_len as u32);
+        if new_skb.is_null() { return; }
+        let dest = skb_put(new_skb, plaintext_len as u32);
+        core::ptr::copy_nonoverlapping(plaintext_buf.as_ptr(), dest, plaintext_len);
+        wg_net_rx((*state).net_dev, new_skb);
     }
 }
 
