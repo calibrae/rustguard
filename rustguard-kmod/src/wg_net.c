@@ -40,6 +40,14 @@ static unsigned int role = 0;
 module_param(role, uint, 0644);
 MODULE_PARM_DESC(role, "0=initiator (send=key_a,recv=key_b), 1=responder (reversed)");
 
+static unsigned int async_crypto = 0;
+module_param(async_crypto, uint, 0644);
+MODULE_PARM_DESC(async_crypto, "1=async TX via workqueue (lower retransmits), 0=sync (higher throughput)");
+
+unsigned int wg_param_async_crypto(void);
+unsigned int wg_param_async_crypto(void) { return async_crypto; }
+EXPORT_SYMBOL_GPL(wg_param_async_crypto);
+
 static char peer_pubkey_hex[65] = "";
 module_param_string(peer_pubkey, peer_pubkey_hex, sizeof(peer_pubkey_hex), 0644);
 MODULE_PARM_DESC(peer_pubkey, "Peer public key as 64 hex chars");

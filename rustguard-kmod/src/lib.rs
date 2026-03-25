@@ -100,6 +100,7 @@ extern "C" {
     fn wg_param_peer_port() -> u32;
     fn wg_param_role() -> u32;
     fn wg_param_peer_pubkey(out: *mut u8) -> i32;
+    fn wg_param_async_crypto() -> u32;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────
@@ -434,23 +435,22 @@ unsafe fn do_xmit(skb: VoidPtr, priv_: VoidPtr) -> i32 {
         hdr_slice[4..8].copy_from_slice(&session.their_index.to_le_bytes());
         hdr_slice[8..16].copy_from_slice(&counter.to_le_bytes());
 
-        // Queue for async encrypt + send in process context (FPU safe).
-        // The workqueue worker does SG encrypt → kernel_sendmsg → kfree_skb.
-        // Ownership of tx_skb transfers to the workqueue.
-        let ret = wg_queue_encrypt(
-            tx_skb,
-            WG_HEADER_SIZE as u32,
-            data_len,
-            counter,
-            session.key_send.as_ptr(),
-            state.udp_sock,
-            peer.endpoint_ip, peer.endpoint_port,
-            state.net_dev,
-        );
-
-        if ret != 0 {
+        if wg_param_async_crypto() != 0 {
+            // Async: queue to workqueue (lower retransmits, higher latency).
+            let ret = wg_queue_encrypt(
+                tx_skb, WG_HEADER_SIZE as u32, data_len, counter,
+                session.key_send.as_ptr(), state.udp_sock,
+                peer.endpoint_ip, peer.endpoint_port, state.net_dev,
+            );
+            if ret != 0 { wg_kfree_skb(tx_skb); }
+        } else {
+            // Sync: encrypt + send inline (higher throughput).
+            wg_encrypt_skb(tx_skb, WG_HEADER_SIZE as u32, data_len,
+                           counter, session.key_send.as_ptr());
+            wg_socket_send_skb(state.udp_sock, tx_skb,
+                               peer.endpoint_ip, peer.endpoint_port);
             wg_kfree_skb(tx_skb);
-            return 0;
+            wg_tx_stats(state.net_dev, data_len);
         }
 
         0
