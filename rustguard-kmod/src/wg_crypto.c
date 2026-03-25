@@ -267,11 +267,9 @@ struct sk_buff *wg_decrypt_skb_full(struct sk_buff *skb, u32 hdr_len,
 		return NULL;
 	}
 
-	/* Trim the AEAD tag. */
-	if (pskb_trim(nskb, ct_len - CHACHA20POLY1305_AUTHTAG_SIZE)) {
-		kfree_skb(nskb);
-		return NULL;
-	}
+	/* Trim the AEAD tag by adjusting skb->len directly.
+	 * skb_copy guaranteed linear, so skb_trim is safe (no frags). */
+	skb_trim(nskb, ct_len - CHACHA20POLY1305_AUTHTAG_SIZE);
 
 	return nskb;
 }
