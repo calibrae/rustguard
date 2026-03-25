@@ -67,13 +67,8 @@ static int wg_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	/* Strip the UDP header — we want the WireGuard payload. */
 	__skb_pull(skb, sizeof(struct udphdr));
 
-	/* Ensure the skb data is linear (not fragmented).
-	 * RX decrypt uses buffer-based path (copy to stack, decrypt, alloc new skb)
-	 * because incoming skbs may be cloned and in-place SG decrypt crashes. */
-	if (skb_linearize(skb)) {
-		kfree_skb(skb);
-		return 0;
-	}
+	/* skb_cow_data inside wg_decrypt_skb handles linearization,
+	 * uncloning, and fragment handling. No pre-processing needed. */
 
 	return rustguard_rx(skb, rust_priv, src_ip, src_port);
 }

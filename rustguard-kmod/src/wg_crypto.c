@@ -220,19 +220,37 @@ EXPORT_SYMBOL_GPL(wg_encrypt_skb);
  *
  * Returns 0 on success, -EBADMSG on auth failure.
  */
+/*
+ * Decrypt skb payload in-place using scatter-gather AEAD.
+ * Handles both linear and paged skbs correctly, following the same
+ * pattern as kernel WireGuard (receive.c:270-280).
+ *
+ * The skb must have ct_off bytes of header followed by ct_len bytes
+ * of ciphertext + tag.
+ */
 int wg_decrypt_skb(struct sk_buff *skb, u32 ct_off, u32 ct_len,
 		   u64 nonce, const u8 key[32]);
 int wg_decrypt_skb(struct sk_buff *skb, u32 ct_off, u32 ct_len,
 		   u64 nonce, const u8 key[32])
 {
-	struct scatterlist sg;
+	struct scatterlist sg[MAX_SKB_FRAGS + 1];
+	struct sk_buff *trailer;
+	int num_frags;
 
 	if (ct_len < CHACHA20POLY1305_AUTHTAG_SIZE)
 		return -EINVAL;
 
-	sg_init_one(&sg, skb->data + ct_off, ct_len);
+	/* Ensure the skb data is writable (unclone + linearize paged data). */
+	num_frags = skb_cow_data(skb, 0, &trailer);
+	if (unlikely(num_frags < 0 || num_frags > ARRAY_SIZE(sg)))
+		return -ENOMEM;
 
-	if (!chacha20poly1305_decrypt_sg_inplace(&sg, ct_len,
+	/* Build scatter-gather list over the ciphertext region. */
+	sg_init_table(sg, num_frags);
+	if (skb_to_sgvec(skb, sg, ct_off, ct_len) <= 0)
+		return -EINVAL;
+
+	if (!chacha20poly1305_decrypt_sg_inplace(sg, ct_len,
 						  NULL, 0, nonce, key))
 		return -EBADMSG;
 
