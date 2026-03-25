@@ -67,15 +67,12 @@ static int wg_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
 	/* Strip the UDP header — we want the WireGuard payload. */
 	__skb_pull(skb, sizeof(struct udphdr));
 
-	/* Make a writable linear copy. skb_cow_data inside wg_decrypt_skb
-	 * would be cleaner but the encap_rcv skb state causes crashes.
-	 * skb_copy is one extra memcpy but guaranteed safe. */
-	{
-		struct sk_buff *nskb = skb_copy(skb, GFP_ATOMIC);
+	/* Linearize for the buffer-based decrypt path in Rust.
+	 * TODO: RX SG in-place decrypt needs more investigation —
+	 * crashes on encap_rcv skbs even after skb_copy. */
+	if (skb_linearize(skb)) {
 		kfree_skb(skb);
-		if (!nskb)
-			return 0;
-		skb = nskb;
+		return 0;
 	}
 
 	return rustguard_rx(skb, rust_priv, src_ip, src_port);
