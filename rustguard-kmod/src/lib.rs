@@ -24,6 +24,10 @@ mod noise;
 mod allowedips;
 #[allow(dead_code)]
 mod replay;
+#[allow(dead_code)]
+mod timers;
+#[allow(dead_code)]
+mod cookie;
 
 // ── FFI declarations ──────────────────────────────────────────────────
 
@@ -52,6 +56,10 @@ extern "C" {
     ) -> i32;
     fn wg_crypto_init() -> i32;
     fn wg_crypto_exit();
+
+    // wg_genl.c
+    fn wg_genl_init() -> i32;
+    fn wg_genl_exit();
     fn wg_curve25519_generate_secret(secret: *mut u8);
     fn wg_curve25519_generate_public(pub_key: *mut u8, secret: *const u8);
     fn wg_get_random_bytes(buf: *mut u8, len: u32);
@@ -98,6 +106,10 @@ struct Peer {
     pending_handshake: Option<noise::InitiatorState>,
     /// Anti-replay window for incoming packets.
     replay_window: replay::ReplayWindow,
+    /// Session timers (rekey, keepalive, expiry).
+    timers: timers::SessionTimers,
+    /// Client-side cookie state (for MAC2).
+    cookie_state: cookie::CookieState,
 }
 
 /// Module-level device state.
@@ -118,6 +130,8 @@ struct DeviceState {
     allowed_ips: allowedips::AllowedIps,
     /// Sender index → peer index lookup (for RX path).
     index_map: [Option<usize>; 256],
+    /// Cookie checker for DoS protection (server-side).
+    cookie_checker: Option<cookie::CookieChecker>,
 }
 
 unsafe impl Send for DeviceState {}
@@ -190,6 +204,19 @@ impl kernel::Module for RustGuard {
         }
         unsafe { (*state_raw).udp_sock = sock };
 
+        // Init cookie checker for DoS protection.
+        unsafe {
+            (*state_raw).cookie_checker = Some(cookie::CookieChecker::new(static_public));
+        }
+
+        // Register genetlink family for wg(8) tool compatibility.
+        let genl_ret = unsafe { wg_genl_init() };
+        if genl_ret != 0 {
+            // Non-fatal — the wg tool won't work but the tunnel still functions.
+            // Will fail if kernel WireGuard already registered the "wireguard" family.
+            pr_info!("rustguard: genetlink registration failed ({}), wg tool unavailable\n", genl_ret);
+        }
+
         // Configure peer from module params.
         let pip = unsafe { wg_param_peer_ip() };
         let pport = unsafe { wg_param_peer_port() } as u16;
@@ -207,6 +234,8 @@ impl kernel::Module for RustGuard {
                 session: None,
                 pending_handshake: None,
                 replay_window: replay::ReplayWindow::new(),
+                timers: timers::SessionTimers::new(),
+                cookie_state: cookie::CookieState::new(),
             };
 
             unsafe {
@@ -276,6 +305,7 @@ impl Drop for RustGuard {
                 cleanup_state(state_raw);
             }
         }
+        unsafe { wg_genl_exit() };
         unsafe { wg_crypto_exit() };
         pr_info!("rustguard: unloaded\n");
     }
@@ -446,6 +476,7 @@ unsafe fn handle_initiation(state: &mut DeviceState, pkt: &[u8], pkt_len: usize)
                 peer.public_key = initiator_public;
                 peer.session = Some(keys);
                 peer.replay_window = replay::ReplayWindow::new();
+                peer.timers.session_started();
                 pr_info!("rustguard: session established (responder)\n");
             }
         }
@@ -471,6 +502,7 @@ unsafe fn handle_response(state: &mut DeviceState, pkt: &[u8], pkt_len: usize) {
         if let Some(ref mut peer) = state.peers[0] {
             peer.session = Some(keys);
             peer.replay_window = replay::ReplayWindow::new();
+            peer.timers.session_started();
             pr_info!("rustguard: session established (initiator)\n");
         }
     }
@@ -549,6 +581,24 @@ unsafe fn handle_transport(state: &mut DeviceState, skb: VoidPtr, pkt: &[u8], pk
 /// Device teardown callback.
 #[no_mangle]
 pub extern "C" fn rustguard_dev_uninit(_priv: VoidPtr) {}
+
+/// Genetlink GET callback (stub — returns device info).
+#[no_mangle]
+pub extern "C" fn rustguard_genl_get(
+    _priv_data: VoidPtr, _msg_buf: VoidPtr, _buf_len: i32,
+) -> i32 {
+    0
+}
+
+/// Genetlink SET callback (stub — configures peers).
+#[no_mangle]
+pub extern "C" fn rustguard_genl_set(
+    _priv_data: VoidPtr,
+    _peer_pubkey: *const u8, _endpoint_ip: u32, _endpoint_port: u16,
+    _allowed_ip: *const u8, _allowed_cidr: u8, _allowed_family: u16,
+) -> i32 {
+    0
+}
 
 fn is_err_ptr(ptr: VoidPtr) -> bool {
     let val = ptr as isize;
