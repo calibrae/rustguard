@@ -21,7 +21,7 @@ struct TrieNode {
     /// Peer index (valid when cidr > 0).
     peer_idx: usize,
     /// Children: [0] for bit=0, [1] for bit=1.
-    children: [Option<KBox<TrieNode>>, 2],
+    children: [Option<KBox<TrieNode>>; 2],
 }
 
 /// AllowedIPs routing table.
