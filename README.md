@@ -228,25 +228,63 @@ rustguard serve --pool 10.150.0.0/24 --token s --xdp enp7s0    # AF_XDP zero-cop
 rustguard serve --pool 10.150.0.0/24 --token s --uring          # io_uring batched I/O
 ```
 
+## Footprint
+
+**8,551 lines of Rust** across 7 crates + **596 lines of C** kernel shims. 46 commits.
+
+Kernel module breakdown (1,601 lines total):
+
+| File | Lines | Role |
+|------|-------|------|
+| `noise.rs` | 485 | Noise_IK handshake, Curve25519 DH, BLAKE2s HKDF, key derivation |
+| `lib.rs` | 520 | Module init, device state, TX/RX packet paths, peer management |
+| `wg_net.c` | 231 | net_device registration, skb helpers, module params |
+| `wg_crypto.c` | 214 | ChaCha20-Poly1305, BLAKE2s, HKDF, Curve25519 (kernel lib wrappers) |
+| `wg_socket.c` | 151 | Kernel UDP socket, encap_rcv callback |
+
+63% Rust, 37% C. The C is pure plumbing (kernel APIs without Rust bindings). The protocol logic, state machine, and packet handling are all Rust. For reference, kernel WireGuard is ~4,000 lines of C.
+
 ## Building
 
-```bash
-# Native
-cargo build --release
+### Userspace
 
-# Cross-compile for Linux (from macOS)
-cargo build --release --target x86_64-unknown-linux-musl
+```bash
+cargo build --release
+cargo build --release --target x86_64-unknown-linux-musl  # cross-compile
 ```
 
-The release profile strips symbols, enables LTO, and optimizes for size (`opt-level = "z"`). Produces a ~637KB static binary.
+### Kernel module
+
+Requires a Linux 6.10+ kernel source tree with `CONFIG_RUST=y`:
+
+```bash
+cd rustguard-kmod
+make modules KDIR=/path/to/linux-source KBUILD_MODPOST_WARN=1 CONFIG_DEBUG_INFO_BTF_MODULES=
+```
+
+The Makefile stages shared crate sources, rewrites imports for Kbuild, and compiles via the kernel build system.
+
+```bash
+# Load with peer configuration
+sudo insmod rustguard.ko peer_ip=0x0A0A0033 peer_port=51820 role=0 \
+    peer_pubkey=<64-char-hex>
+
+# Configure interface
+sudo ip addr add 10.150.0.1/24 dev wg0
+sudo ip link set wg0 up
+```
 
 ## Test Infrastructure
 
+### Userspace benchmarks
 - Two Debian 12 VMs on an Intel N305 hypervisor
-- Intel i225 2.5G NICs passed through to VMs (PCIe passthrough)
+- Intel i225 2.5G NICs with PCIe passthrough
 - Direct connection: `192.168.99.1` ↔ `192.168.99.2`
-- Benchmarks via `iperf3`, single TCP stream, 30-second runs
-- Cross-compiled from M1 Mac via `musl-cross`
+
+### Kernel module benchmarks
+- Same VMs, virtio-net (shared memory between VMs)
+- Custom kernel 6.12.74 built with `CONFIG_RUST=y` on i9-9900K WSL2
+- Module cross-compiled on WSL2, deployed via scp
 
 ## What I Learned
 
