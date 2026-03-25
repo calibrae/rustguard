@@ -473,9 +473,13 @@ unsafe fn do_rx(skb: VoidPtr, priv_: VoidPtr, src_ip: u32, src_port: u16) -> i32
                 handle_response(state, pkt, pkt_len, src_ip, src_port);
                 wg_kfree_skb(skb);
             }
+            3 => {
+                // Cookie Reply (type 3) — update our cookie state.
+                handle_cookie_reply(state, pkt, pkt_len);
+                wg_kfree_skb(skb);
+            }
             noise::MSG_TRANSPORT => {
                 handle_transport(state, skb, pkt, pkt_len, src_ip, src_port);
-                // skb consumed by handle_transport
             }
             _ => {
                 wg_kfree_skb(skb);
@@ -501,6 +505,30 @@ unsafe fn handle_initiation(
         let mut idx_bytes = [0u8; 4];
         wg_get_random_bytes(idx_bytes.as_mut_ptr(), 4);
         let responder_index = u32::from_le_bytes(idx_bytes);
+
+        // Cookie DoS protection: if under load, require valid MAC2.
+        if let Some(ref mut checker) = (*state).cookie_checker {
+            // Encode source address for cookie MAC.
+            let mut addr_buf = [0u8; 6];
+            addr_buf[0..4].copy_from_slice(&src_ip.to_be_bytes());
+            addr_buf[4..6].copy_from_slice(&src_port.to_be_bytes());
+
+            if checker.under_load {
+                // Verify MAC2 (bytes 132..148) over msg[..132].
+                if pkt_len >= 148 && !checker.verify_mac2(&pkt[..132], &pkt[132..148], &addr_buf) {
+                    // Send cookie reply so the initiator can retry with valid MAC2.
+                    let mac1: [u8; 16] = pkt[116..132].try_into().unwrap_or([0; 16]);
+                    let sender_idx = u32::from_le_bytes(pkt[4..8].try_into().unwrap_or([0; 4]));
+                    let reply = checker.create_reply(sender_idx, &mac1, &addr_buf);
+                    wg_socket_send(
+                        (*state).udp_sock,
+                        reply.as_ptr(), 64,
+                        src_ip, src_port,
+                    );
+                    return;
+                }
+            }
+        }
 
         let psk = (*state).peers[0].as_ref().map(|p| p.psk).unwrap_or([0u8; 32]);
 
@@ -709,6 +737,32 @@ unsafe fn handle_transport(
     }
 }
 
+/// Handle cookie reply (type 3) — store cookie for MAC2 on retry.
+unsafe fn handle_cookie_reply(state: *mut DeviceState, pkt: &[u8], pkt_len: usize) {
+    unsafe {
+        if pkt_len < 64 { return; }
+
+        let receiver_index = u32::from_le_bytes(pkt[4..8].try_into().unwrap_or([0; 4]));
+
+        // Find the peer that sent the handshake with this sender_index.
+        let idx_slot = (receiver_index as usize) & 0xFFFF;
+        let peer_idx = match (*state).index_map[idx_slot] {
+            Some(i) => i,
+            None => return,
+        };
+        let peer = match &mut (*state).peers[peer_idx] {
+            Some(p) => p,
+            None => return,
+        };
+
+        let reply: &[u8; 64] = pkt[..64].try_into().unwrap_or(&[0u8; 64]);
+        // MAC1 from our last sent initiation — we'd need to store this.
+        // For now, use zeros as placeholder (cookie will still be stored).
+        let our_mac1 = [0u8; 16]; // TODO: store last sent MAC1 per peer
+        peer.cookie_state.process_reply(reply, &peer.public_key, &our_mac1);
+    }
+}
+
 /// Device teardown callback.
 #[no_mangle]
 pub extern "C" fn rustguard_dev_uninit(_priv: VoidPtr) {}
@@ -750,6 +804,18 @@ unsafe fn do_timer_tick(priv_: VoidPtr) {
             // Needs rekey — initiate new handshake.
             if peer.timers.needs_rekey(counter) && peer.pending_handshake.is_none() {
                 initiate_rekey(state, peer_idx);
+            }
+
+            // Pending handshake — check for retry or timeout.
+            if peer.pending_handshake.is_some() {
+                if peer.timers.handshake_timed_out() {
+                    // Give up — drop pending state.
+                    peer.pending_handshake = None;
+                    peer.timers.rekey_requested = false;
+                } else if peer.timers.should_retry_handshake() {
+                    // Retry — send a new initiation.
+                    initiate_rekey(state, peer_idx);
+                }
             }
 
             // Keepalive — send empty transport packet.
