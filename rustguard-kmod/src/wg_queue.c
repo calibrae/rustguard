@@ -113,16 +113,25 @@ static void wg_decrypt_worker(struct work_struct *work)
 	pt_len = ct_len - CHACHA20POLY1305_AUTHTAG_SIZE;
 	ct_data = w->skb->data + w->hdr_len;
 
-	/* Decrypt to a fresh skb (input may be cloned/shared). */
-	nskb = alloc_skb(pt_len, GFP_KERNEL); /* GFP_KERNEL — we can sleep! */
+	/* Decrypt in-place on a writable copy, then trim. */
+	nskb = skb_copy(w->skb, GFP_KERNEL);
 	if (!nskb)
 		goto out;
 
-	if (!chacha20poly1305_decrypt(skb_put(nskb, pt_len), ct_data,
-				      ct_len, NULL, 0, w->nonce, w->key)) {
-		kfree_skb(nskb);
-		goto out;
+	/* Pull WG header, decrypt ciphertext in-place via SG. */
+	skb_pull(nskb, w->hdr_len);
+	{
+		struct scatterlist sg;
+		sg_init_one(&sg, nskb->data, ct_len);
+		if (!chacha20poly1305_decrypt_sg_inplace(&sg, ct_len,
+							  NULL, 0, w->nonce,
+							  w->key)) {
+			kfree_skb(nskb);
+			goto out;
+		}
 	}
+	/* Trim the AEAD tag. */
+	skb_trim(nskb, pt_len);
 
 	wg_net_rx(w->dev, nskb);
 
