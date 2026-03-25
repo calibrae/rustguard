@@ -198,7 +198,6 @@ int wg_encrypt_skb(struct sk_buff *skb, u32 plaintext_off, u32 plaintext_len,
 		   u64 nonce, const u8 key[32])
 {
 	struct scatterlist sg;
-	int ret;
 
 	/* Build SG over the plaintext + tag region of the skb.
 	 * The skb was pre-allocated with room for the tag by
