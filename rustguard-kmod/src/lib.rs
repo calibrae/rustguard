@@ -50,9 +50,18 @@ extern "C" {
         key: *const u8, nonce: u64, src: *const u8, src_len: u32,
         ad: *const u8, ad_len: u32, dst: *mut u8,
     ) -> i32;
-    // wg_crypto.c — zero-copy skb (for transport hot path)
+    // wg_crypto.c — skb encrypt (used by keepalive)
     fn wg_encrypt_skb(skb: VoidPtr, plaintext_off: u32, plaintext_len: u32,
                       nonce: u64, key: *const u8) -> i32;
+
+    // wg_queue.c — async crypto workqueue (process context, FPU safe)
+    fn wg_queue_init() -> i32;
+    fn wg_queue_destroy();
+    fn wg_queue_encrypt(skb: VoidPtr, plaintext_off: u32, plaintext_len: u32,
+                        nonce: u64, key: *const u8, sock: VoidPtr,
+                        dst_ip: u32, dst_port: u16, dev: VoidPtr) -> i32;
+    fn wg_queue_decrypt(skb: VoidPtr, hdr_len: u32, nonce: u64,
+                        key: *const u8, dev: VoidPtr) -> i32;
     /// Full RX pipeline: copy → SG decrypt → pull header → trim tag.
     /// Returns new skb with plaintext, or null on failure.
     /// Original skb is NOT consumed.
@@ -167,6 +176,12 @@ impl kernel::Module for RustGuard {
         let cret = unsafe { wg_crypto_init() };
         if cret != 0 {
             pr_err!("rustguard: crypto init failed\n");
+            return Err(ENOMEM);
+        }
+
+        let qret = unsafe { wg_queue_init() };
+        if qret != 0 {
+            pr_err!("rustguard: crypto workqueue init failed\n");
             return Err(ENOMEM);
         }
 
@@ -333,6 +348,7 @@ impl Drop for RustGuard {
                 cleanup_state(state_raw);
             }
         }
+        unsafe { wg_queue_destroy() };
         unsafe { wg_genl_exit() };
         unsafe { wg_crypto_exit() };
         pr_info!("rustguard: unloaded\n");
@@ -402,16 +418,15 @@ unsafe fn do_xmit(skb: VoidPtr, priv_: VoidPtr) -> i32 {
             return 0;
         }
 
-        // Zero-copy path: build transport skb from plaintext skb.
-        // wg_skb_prepend_header copies plaintext into a new skb with header + tag room.
+        // Build transport skb: header + plaintext + tag room.
         let tx_skb = wg_skb_prepend_header(
             skb, WG_HEADER_SIZE as u32, AEAD_TAG_SIZE as u32,
         );
-        wg_kfree_skb(skb); // free original plaintext skb
+        wg_kfree_skb(skb);
 
         if tx_skb.is_null() { return 0; }
 
-        // Write WireGuard header into the first 16 bytes.
+        // Write WireGuard header.
         let counter = session.send_counter.fetch_add(1, Ordering::Relaxed);
         let hdr = wg_skb_data_ptr(tx_skb);
         let hdr_slice = core::slice::from_raw_parts_mut(hdr, WG_HEADER_SIZE);
@@ -419,28 +434,24 @@ unsafe fn do_xmit(skb: VoidPtr, priv_: VoidPtr) -> i32 {
         hdr_slice[4..8].copy_from_slice(&session.their_index.to_le_bytes());
         hdr_slice[8..16].copy_from_slice(&counter.to_le_bytes());
 
-        // Encrypt in-place: the plaintext starts at offset WG_HEADER_SIZE.
-        let ret = wg_encrypt_skb(
+        // Queue for async encrypt + send in process context (FPU safe).
+        // The workqueue worker does SG encrypt → kernel_sendmsg → kfree_skb.
+        // Ownership of tx_skb transfers to the workqueue.
+        let ret = wg_queue_encrypt(
             tx_skb,
             WG_HEADER_SIZE as u32,
             data_len,
             counter,
             session.key_send.as_ptr(),
+            state.udp_sock,
+            peer.endpoint_ip, peer.endpoint_port,
+            state.net_dev,
         );
 
         if ret != 0 {
             wg_kfree_skb(tx_skb);
             return 0;
         }
-
-        // Send the encrypted skb via UDP.
-        wg_socket_send_skb(
-            state.udp_sock, tx_skb,
-            peer.endpoint_ip, peer.endpoint_port,
-        );
-        wg_kfree_skb(tx_skb);
-
-        wg_tx_stats(state.net_dev, data_len);
 
         0
     }
@@ -694,38 +705,49 @@ unsafe fn handle_transport(
             return;
         }
 
-        // RX: decrypt to stack buffer, alloc one output skb.
-        // Faster than alloc_skb in C because stack buffer = zero alloc for decrypt.
+        // Try current session key, then previous.
+        // We need to verify AEAD before updating replay window, but the
+        // decrypt is async. For now: do a synchronous buffer-based AEAD check
+        // to validate, then queue the full decrypt for injection.
+        // TODO: move replay window update to the decrypt worker.
         let encrypted = &pkt[WG_HEADER_SIZE..];
         let encrypted_len = encrypted.len();
 
-        let mut plaintext_buf = [0u8; 2048];
-        if encrypted_len > plaintext_buf.len() {
-            wg_kfree_skb(skb);
-            return;
-        }
+        let mut key_to_use: Option<*const u8> = None;
+        let mut test_buf = [0u8; 16]; // just need to verify AEAD, not full decrypt
 
-        let mut decrypted = false;
+        // Fast AEAD check with buffer API (works in softirq).
         if let Some(ref session) = peer.session {
-            if wg_chacha20poly1305_decrypt(
-                session.key_recv.as_ptr(), counter,
-                encrypted.as_ptr(), encrypted_len as u32,
-                core::ptr::null(), 0, plaintext_buf.as_mut_ptr(),
-            ) == 0 { decrypted = true; }
-        }
-        if !decrypted {
-            if let Some(ref prev) = peer.prev_session {
+            if encrypted_len >= AEAD_TAG_SIZE {
                 if wg_chacha20poly1305_decrypt(
-                    prev.key_recv.as_ptr(), counter,
+                    session.key_recv.as_ptr(), counter,
                     encrypted.as_ptr(), encrypted_len as u32,
-                    core::ptr::null(), 0, plaintext_buf.as_mut_ptr(),
-                ) == 0 { decrypted = true; }
+                    core::ptr::null(), 0, test_buf.as_mut_ptr(),
+                ) == 0 {
+                    key_to_use = Some(session.key_recv.as_ptr());
+                }
+            }
+        }
+        if key_to_use.is_none() {
+            if let Some(ref prev) = peer.prev_session {
+                if encrypted_len >= AEAD_TAG_SIZE {
+                    if wg_chacha20poly1305_decrypt(
+                        prev.key_recv.as_ptr(), counter,
+                        encrypted.as_ptr(), encrypted_len as u32,
+                        core::ptr::null(), 0, test_buf.as_mut_ptr(),
+                    ) == 0 {
+                        key_to_use = Some(prev.key_recv.as_ptr());
+                    }
+                }
             }
         }
 
-        wg_kfree_skb(skb);
-        if !decrypted { return; }
+        let key_ptr = match key_to_use {
+            Some(k) => k,
+            None => { wg_kfree_skb(skb); return; }
+        };
 
+        // AEAD verified — update replay window and roaming.
         peer.replay_window.update(counter);
         peer.timers.packet_received();
 
@@ -734,12 +756,13 @@ unsafe fn handle_transport(
             peer.endpoint_port = src_port;
         }
 
-        let plaintext_len = encrypted_len - AEAD_TAG_SIZE;
-        let new_skb = wg_alloc_skb(plaintext_len as u32);
-        if new_skb.is_null() { return; }
-        let dest = skb_put(new_skb, plaintext_len as u32);
-        core::ptr::copy_nonoverlapping(plaintext_buf.as_ptr(), dest, plaintext_len);
-        wg_net_rx((*state).net_dev, new_skb);
+        // Queue async decrypt (process context, GFP_KERNEL alloc).
+        // The worker decrypts to a fresh skb and calls wg_net_rx.
+        // Ownership of skb transfers to the workqueue.
+        if wg_queue_decrypt(skb, WG_HEADER_SIZE as u32, counter,
+                            key_ptr, (*state).net_dev) != 0 {
+            wg_kfree_skb(skb);
+        }
     }
 }
 
