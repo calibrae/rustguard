@@ -757,9 +757,6 @@ unsafe fn handle_transport(
             // skb ownership transferred to workqueue
         } else {
             // Sync: decrypt + inject inline.
-            let plaintext_len = encrypted_len - AEAD_TAG_SIZE;
-            // We already verified AEAD — decrypt is guaranteed to succeed.
-            // Use the C pipeline for fresh skb creation.
             let pt_skb = wg_decrypt_skb_full(skb, WG_HEADER_SIZE as u32,
                                               counter, key_ptr);
             wg_kfree_skb(skb);
