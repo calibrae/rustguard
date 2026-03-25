@@ -180,13 +180,16 @@ Built an out-of-tree Linux kernel module in Rust targeting 6.10+:
 
 #### Kernel Module — Real Hardware (Intel I226-V 2.5G, PCIe passthrough, direct cable)
 
-| Configuration | Throughput | % of Wire Speed |
-|---|---|---|
-| Bare wire (I226-V 2.5G) | 2,350 Mbps | 100% |
-| Kernel WireGuard (C) | 2,230 Mbps | 94.9% |
-| **RustGuard kmod** | **1,670–2,130 Mbps** | **71–91%** |
+| Configuration | Throughput | Retransmits | % of Kernel WG |
+|---|---|---|---|
+| Bare wire (I226-V 2.5G) | 2,350 Mbps | 0 | — |
+| Kernel WireGuard (C) | 2,230 Mbps | 0 | 100% |
+| **RustGuard sync** (default) | **2,130 Mbps** | 25K | **95.5%** |
+| **RustGuard async** (workqueue) | **1,530 Mbps** | 7K | **68.6%** |
 
-75–95% of kernel WireGuard on real 2.5G Ethernet. Single-threaded, no parallel crypto workqueues. The range is from VM scheduling variance on the shared hypervisor.
+Two modes via `async_crypto` module param:
+- **sync** (default): encrypt/decrypt inline in softirq. Max throughput, higher retransmits.
+- **async** (`async_crypto=1`): SG encrypt/decrypt in per-CPU workqueue. Lower retransmits (75% reduction), lower throughput from scheduling overhead.
 
 #### Kernel Module — Virtual (virtio-net VMs, same hypervisor)
 
@@ -196,15 +199,28 @@ Built an out-of-tree Linux kernel module in Rust targeting 6.10+:
 | Kernel WireGuard (C) | 4,190 Mbps | 12.7% |
 | **RustGuard kmod** | **1,180 Mbps** | **3.6%** |
 
-#### What Closes the Gap
+#### The 16-Byte Bug
 
-The remaining gap to kernel WireGuard is well-understood:
+We spent 15+ commits debugging "SG crashes" — trying `skb_cow_data`, `skb_copy`, `pskb_expand_head`, reverting to buffer paths, blaming page boundaries. The root cause was a **16-byte stack buffer overflow** in the AEAD verification path:
 
-1. **Parallel crypto workqueues** — Jason's code encrypts/decrypts on per-CPU worker threads. We're single-threaded on the xmit/encap_rcv softirq path.
-2. **SG AEAD on skb fragments** — kernel WireGuard uses `skb_to_sgvec` to decrypt in-place across paged skb fragments. We decrypt to a stack buffer because `sg_init_one` crashes on data spanning 4KB page boundaries, and `skb_cow_data` crashes on encap_rcv skbs. Solving this requires the full `skb_push → skb_cow_data → skb_to_sgvec → decrypt → pskb_trim → skb_pull` dance that Jason implements in `receive.c`.
-3. **TX skb reuse** — we allocate a fresh skb per packet for the WireGuard header + encrypted payload. Kernel WireGuard reuses the original skb with headroom expansion.
+```rust
+let mut verify = [0u8; 16]; // 16 bytes
+// chacha20poly1305_decrypt writes src_len - 16 bytes to dst
+// For a 1436-byte ciphertext: writes 1420 bytes into 16-byte buffer
+wg_chacha20poly1305_decrypt(..., verify.as_mut_ptr())  // STACK SMASH
+```
 
-The fundamental result: **going from userspace (TUN) to kernel (net_device) gave a 3.5–4.5x throughput improvement** — from 472 Mbps to 1,670–2,130 Mbps — confirming that TUN was always the bottleneck.
+Once fixed, the SG scatter-gather AEAD path worked perfectly in the workqueue — both encrypt and decrypt. Every "crash" we attributed to SG, page boundaries, or `skb_cow_data` was this one bug. Serial console output on the crash confirmed: `RIP: rustguard_rx+0x248b`.
+
+#### What Closes the Remaining Gap
+
+The async workqueue path (1.53 Gbps) vs kernel WireGuard (2.23 Gbps) gap is from per-packet overhead:
+
+1. **Packet batching** — Jason queues N packets then processes them in one worker invocation. We queue one work item per packet (`kmalloc` + `queue_work` per packet).
+2. **TX skb reuse** — we allocate a fresh skb per packet. Kernel WireGuard reuses the original with headroom expansion.
+3. **NAPI integration** — kernel WireGuard uses NAPI for RX batching. We inject via `netif_rx` per packet.
+
+The fundamental result: **going from userspace (TUN) to kernel (net_device) gave a 3.5–4.5x throughput improvement** — from 472 Mbps to 1,530–2,130 Mbps — confirming that TUN was always the bottleneck.
 
 ## Usage
 
@@ -246,9 +262,9 @@ rustguard serve --pool 10.150.0.0/24 --token s --uring          # io_uring batch
 
 ## Footprint
 
-**9,400+ lines of Rust** across 7 crates + **934 lines of C** kernel shims.
+**9,400+ lines of Rust** across 7 crates + **1,155 lines of C** kernel shims. 95 commits.
 
-Kernel module breakdown (3,068 lines total):
+Kernel module breakdown (3,300 lines total):
 
 | File | Lines | Role |
 |------|-------|------|
@@ -258,13 +274,14 @@ Kernel module breakdown (3,068 lines total):
 | `cookie.rs` | 205 | DoS protection: MAC1/MAC2 verification, cookie reply |
 | `timers.rs` | 154 | Session timers: rekey, keepalive, expiry state machine |
 | `replay.rs` | 98 | Anti-replay 2048-bit sliding window |
-| `wg_net.c` | 294 | net_device, module params, skb helpers, TX skb pipeline |
+| `wg_net.c` | 302 | net_device, module params, skb helpers, TX skb pipeline |
 | `wg_crypto.c` | 267 | ChaCha20-Poly1305, BLAKE2s, HKDF, Curve25519, secure memory |
+| `wg_queue.c` | 213 | Async crypto workqueue: SG encrypt/decrypt in process context |
 | `wg_socket.c` | 179 | Kernel UDP socket, encap_rcv callback |
 | `wg_genl.c` | 140 | Genetlink skeleton for `wg` tool compatibility |
 | `wg_timer.c` | 54 | Periodic workqueue timer for rekey/keepalive |
 
-70% Rust, 30% C. The C is pure plumbing (kernel APIs without Rust bindings yet). All protocol logic — handshake, routing, replay, timers, cookies, rekeying — is Rust. For reference, kernel WireGuard is ~4,000 lines of C; we're at 3,068 (77%) with full protocol coverage.
+65% Rust, 35% C. The C is pure plumbing (kernel APIs without Rust bindings). All protocol logic — handshake, routing, replay, timers, cookies, rekeying — is Rust. For reference, kernel WireGuard is ~4,000 lines of C; we're at 3,300 (83%) with full protocol coverage + two crypto modes.
 
 ## Building
 
