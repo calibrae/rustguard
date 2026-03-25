@@ -235,9 +235,7 @@ struct sk_buff *wg_decrypt_skb_full(struct sk_buff *skb, u32 hdr_len,
 				    u64 nonce, const u8 key[32])
 {
 	struct sk_buff *nskb;
-	struct scatterlist sg[MAX_SKB_FRAGS + 1];
-	struct sk_buff *trailer;
-	int num_frags;
+	struct scatterlist sg;
 	u32 ct_len;
 
 	if (skb->len <= hdr_len + CHACHA20POLY1305_AUTHTAG_SIZE)
@@ -245,7 +243,11 @@ struct sk_buff *wg_decrypt_skb_full(struct sk_buff *skb, u32 hdr_len,
 
 	ct_len = skb->len - hdr_len;
 
-	/* Make a writable copy. */
+	/* Make a writable linear copy. skb_copy guarantees:
+	 * - Linear (no frags, data_len == 0)
+	 * - Exclusive (refcount == 1, not cloned)
+	 * - All data in skb->data[0..skb->len]
+	 */
 	nskb = skb_copy(skb, GFP_ATOMIC);
 	if (!nskb)
 		return NULL;
@@ -253,22 +255,13 @@ struct sk_buff *wg_decrypt_skb_full(struct sk_buff *skb, u32 hdr_len,
 	/* Pull the WireGuard header so data starts at ciphertext. */
 	skb_pull(nskb, hdr_len);
 
-	/* skb_cow_data ensures the data is writable and returns frag count. */
-	num_frags = skb_cow_data(nskb, 0, &trailer);
-	if (unlikely(num_frags < 0 || num_frags > ARRAY_SIZE(sg))) {
-		kfree_skb(nskb);
-		return NULL;
-	}
-
-	/* Build proper multi-page SG list. */
-	sg_init_table(sg, num_frags);
-	if (skb_to_sgvec(nskb, sg, 0, ct_len) <= 0) {
-		kfree_skb(nskb);
-		return NULL;
-	}
+	/* Single SG entry — skb_copy guarantees linear data.
+	 * No skb_cow_data needed (it crashes on some encap_rcv skb states).
+	 * No skb_to_sgvec needed (data is contiguous, no frags). */
+	sg_init_one(&sg, nskb->data, ct_len);
 
 	/* Decrypt in place. */
-	if (!chacha20poly1305_decrypt_sg_inplace(sg, ct_len,
+	if (!chacha20poly1305_decrypt_sg_inplace(&sg, ct_len,
 						  NULL, 0, nonce, key)) {
 		kfree_skb(nskb);
 		return NULL;
