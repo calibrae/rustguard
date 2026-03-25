@@ -16,8 +16,6 @@ const REJECT_AFTER_TIME_NS: u64 = 180 * 1_000_000_000;
 const REKEY_TIMEOUT_NS: u64 = 5 * 1_000_000_000;
 /// Give up on handshake after 90 seconds.
 const REKEY_ATTEMPT_TIME_NS: u64 = 90 * 1_000_000_000;
-/// Keepalive interval (10 seconds).
-const KEEPALIVE_TIMEOUT_NS: u64 = 10 * 1_000_000_000;
 /// Zero session keys after 240 seconds of inactivity.
 const DEAD_SESSION_TIMEOUT_NS: u64 = 240 * 1_000_000_000;
 

@@ -172,11 +172,6 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     (secret, public)
 }
 
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut buf = [0u8; N];
-    unsafe { wg_get_random_bytes(buf.as_mut_ptr(), N as u32) };
-    buf
-}
 
 // ── Noise helpers ─────────────────────────────────────────────────────
 

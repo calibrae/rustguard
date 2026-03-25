@@ -47,9 +47,6 @@ pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
 /// How long to wait for a handshake response before retrying.
 pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 
-/// Keepalive interval when configured.
-pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Time after which we zero session keys if no new handshake.
 pub const DEAD_SESSION_TIMEOUT: Duration = Duration::from_secs(240);
 
