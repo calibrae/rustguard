@@ -23,10 +23,19 @@ fn elapsed_since(ts: Timestamp) -> Duration {
 }
 
 #[cfg(not(feature = "std"))]
-fn elapsed_since(_ts: Timestamp) -> Duration {
-    // Kernel callers must use the explicit check methods with their own clock.
-    // This fallback returns zero — the kernel module overrides timer logic.
-    Duration::ZERO
+static NO_STD_TIMER_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(not(feature = "std"))]
+fn now() -> Timestamp {
+    NO_STD_TIMER_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(feature = "std"))]
+fn elapsed_since(ts: Timestamp) -> Duration {
+    // no_std: use counter difference as nanoseconds for ordering.
+    // Kernel callers should use the explicit _at() methods with real timestamps.
+    let current = NO_STD_TIMER_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
+    Duration::from_nanos(current.saturating_sub(ts))
 }
 
 /// After this many seconds, initiate a new handshake.
@@ -35,7 +44,7 @@ pub const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);
 /// Reject data using a keypair older than this.
 pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 
-/// Don't try to send with a keypair older than this (REJECT_AFTER_TIME + padding).
+/// How long to wait after sending a handshake initiation before retrying.
 pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of messages before rekeying.
@@ -148,20 +157,26 @@ impl SessionTimers {
     }
 
     /// Whether we should send a keepalive.
+    ///
+    /// A keepalive is needed when we've recently received data (within the interval)
+    /// but haven't sent anything recently (no send, or last send was >= interval ago).
     pub fn needs_keepalive(&self, keepalive_interval: Option<Duration>) -> bool {
         let interval = match keepalive_interval {
             Some(i) if !i.is_zero() => i,
             _ => return false,
         };
 
-        // Send keepalive if we've received data but haven't sent anything
-        // within the keepalive interval.
-        if let (Some(received), sent) = (self.last_received, self.last_sent) {
-            let last_send_time = sent.unwrap_or(received);
-            return elapsed_since(last_send_time) >= interval
-                && elapsed_since(received) < interval;
+        // We need a recent receive to justify a keepalive.
+        match self.last_received {
+            Some(r) if elapsed_since(r) < interval => {},
+            _ => return false,
+        };
+
+        // Keepalive needed if we've never sent, or last send was >= interval ago.
+        match self.last_sent {
+            None => true,
+            Some(sent) => elapsed_since(sent) >= interval,
         }
-        false
     }
 
     /// Whether we should retry the handshake.

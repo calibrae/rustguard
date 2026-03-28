@@ -30,8 +30,8 @@ use crate::peer::Peer;
 struct TunnelState {
     our_static: StaticSecret,
     peers: Vec<Peer>,
-    /// Maps sender_index -> handshake state. Capped and pruned.
-    pending_handshakes: Vec<(u32, std::time::Instant, handshake::InitiatorHandshake)>,
+    /// Maps sender_index -> (timestamp, peer_index, handshake state). Capped and pruned.
+    pending_handshakes: Vec<(u32, std::time::Instant, usize, handshake::InitiatorHandshake)>,
 }
 
 const MAX_PENDING_HANDSHAKES: usize = 64;
@@ -166,7 +166,7 @@ pub fn run(config: Config) -> io::Result<()> {
                     &st.peers[i].public_key,
                     sender_index,
                 );
-                st.pending_handshakes.push((sender_index, std::time::Instant::now(), init_state));
+                st.pending_handshakes.push((sender_index, std::time::Instant::now(), i, init_state));
                 st.peers[i].timers.last_handshake_sent =
                     Some(std::time::Instant::now());
 
@@ -325,10 +325,10 @@ pub fn run(config: Config) -> io::Result<()> {
                     let pos = st
                         .pending_handshakes
                         .iter()
-                        .position(|(idx, _, _)| *idx == msg.receiver_index);
+                        .position(|(idx, _, _, _)| *idx == msg.receiver_index);
 
                     if let Some(pos) = pos {
-                        let (sender_index, _, init_state) = st.pending_handshakes.remove(pos);
+                        let (_sender_index, _, peer_idx, init_state) = st.pending_handshakes.remove(pos);
                         let result = handshake::process_response(
                             init_state,
                             &st.our_static,
@@ -336,13 +336,8 @@ pub fn run(config: Config) -> io::Result<()> {
                         );
 
                         if let Some(session) = result {
-                            // Find peer that initiated with this sender_index.
-                            if let Some(peer) = st.peers.iter_mut().find(|p| {
-                                (p.endpoint.is_some() && !p.has_active_session())
-                                    || p.session
-                                        .as_ref()
-                                        .is_some_and(|s| s.our_index == sender_index)
-                            }) {
+                            // Look up the peer by the index stored when we created the initiation.
+                            if let Some(peer) = st.peers.get_mut(peer_idx) {
                                 peer.session = Some(session);
                                 peer.endpoint = Some(src_addr);
                                 peer.timers.session_started();
@@ -401,7 +396,7 @@ pub fn run(config: Config) -> io::Result<()> {
             let mut st = state_timer.lock().unwrap();
 
             // Prune stale pending handshakes.
-            st.pending_handshakes.retain(|(_, created, _)| created.elapsed() < HANDSHAKE_EXPIRY);
+            st.pending_handshakes.retain(|(_, created, _, _)| created.elapsed() < HANDSHAKE_EXPIRY);
 
             // Collect handshake retry requests (avoids borrow conflict).
             let mut rekey_requests: Vec<(usize, SocketAddr)> = Vec::new();
@@ -458,7 +453,7 @@ pub fn run(config: Config) -> io::Result<()> {
                 if st.pending_handshakes.len() >= MAX_PENDING_HANDSHAKES {
                     st.pending_handshakes.remove(0); // Drop oldest.
                 }
-                st.pending_handshakes.push((sender_index, std::time::Instant::now(), init_state));
+                st.pending_handshakes.push((sender_index, std::time::Instant::now(), idx, init_state));
                 st.peers[idx].timers.last_handshake_sent =
                     Some(std::time::Instant::now());
 
@@ -502,19 +497,23 @@ fn fill_random(buf: &mut [u8]) {
 
 /// Install a Ctrl-C / SIGTERM handler.
 fn ctrlc_handler(f: impl FnOnce() + Send + 'static) {
-    // Simple approach: spawn a thread that blocks on a signal.
-    let f = std::sync::Mutex::new(Some(f));
+    // Block signals in the main thread BEFORE spawning the handler thread.
+    // Spawned threads inherit the signal mask, so sigwait will work correctly.
+    let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
-        libc::signal(libc::SIGINT, signal_noop as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_noop as *const () as libc::sighandler_t);
+        libc::sigemptyset(&mut sigset);
+        libc::sigaddset(&mut sigset, libc::SIGINT);
+        libc::sigaddset(&mut sigset, libc::SIGTERM);
+        libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
     }
+
+    let f = std::sync::Mutex::new(Some(f));
     thread::spawn(move || {
         let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
             libc::sigemptyset(&mut sigset);
             libc::sigaddset(&mut sigset, libc::SIGINT);
             libc::sigaddset(&mut sigset, libc::SIGTERM);
-            libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
             let mut sig: libc::c_int = 0;
             libc::sigwait(&sigset, &mut sig);
         }
@@ -523,8 +522,6 @@ fn ctrlc_handler(f: impl FnOnce() + Send + 'static) {
         }
     });
 }
-
-extern "C" fn signal_noop(_: libc::c_int) {}
 
 fn base64_key(key: &[u8; 32]) -> String {
     use base64::prelude::*;

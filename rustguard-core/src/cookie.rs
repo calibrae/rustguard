@@ -273,10 +273,17 @@ fn fill_random(buf: &mut [u8]) {
 
 #[cfg(not(feature = "std"))]
 fn fill_random(buf: &mut [u8]) {
-    // Kernel module overrides this — stub zeros for compilation.
-    // In practice, the kernel module uses its own cookie checker
-    // that calls get_random_bytes() directly.
-    let _ = buf;
+    // no_std stub: use an atomic counter to produce unique (not random) bytes.
+    // This prevents nonce reuse — each call gets a different value.
+    // In practice, the kernel module overrides cookie logic with get_random_bytes().
+    static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let val = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Fill buffer with counter bytes, repeating as needed.
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte = (val >> ((i % 8) * 8)) as u8;
+        // Mix in position to avoid identical chunks within a single fill.
+        *byte ^= i as u8;
+    }
 }
 
 fn constant_time_eq_16(a: &[u8; 16], b: &[u8]) -> bool {

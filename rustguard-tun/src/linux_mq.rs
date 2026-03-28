@@ -41,6 +41,7 @@ struct IfreqFlags {
 struct IfreqAddr {
     ifr_name: [u8; IFNAMSIZ],
     ifr_addr: libc::sockaddr_in,
+    _pad: [u8; 8], // Kernel ifreq is 40 bytes on 64-bit; sockaddr_in is 16, name is 16, pad to 40.
 }
 
 #[repr(C)]
@@ -113,7 +114,15 @@ impl MultiQueueTun {
 
             // Additional queues: attach to existing device.
             for _ in 1..num_queues {
-                let fd = open_tun_queue(None)?;
+                let fd = match open_tun_queue(None) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        for &prev_fd in &fds {
+                            libc::close(prev_fd);
+                        }
+                        return Err(e);
+                    }
+                };
                 let mut ifr2 = IfreqFlags {
                     ifr_name: [0; IFNAMSIZ],
                     ifr_flags: IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE,
@@ -212,6 +221,7 @@ unsafe fn configure_interface(ifname: &str, config: &TunConfig) -> io::Result<()
     let mut req = IfreqAddr {
         ifr_name: [0; IFNAMSIZ],
         ifr_addr: make_sockaddr_in(config.address),
+        _pad: [0; 8],
     };
     set_name(&mut req.ifr_name, ifname);
     if libc::ioctl(sock, SIOCSIFADDR, &req as *const _) < 0 {

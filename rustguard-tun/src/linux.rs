@@ -39,6 +39,7 @@ struct IfreqFlags {
 struct IfreqAddr {
     ifr_name: [u8; IFNAMSIZ],
     ifr_addr: libc::sockaddr_in,
+    _pad: [u8; 8], // Kernel ifreq is 40 bytes on 64-bit; sockaddr_in is 16, name is 16, pad to 40.
 }
 
 #[repr(C)]
@@ -132,6 +133,7 @@ fn configure_interface(ifname: &str, config: &TunConfig) -> io::Result<()> {
         let mut req = IfreqAddr {
             ifr_name: [0; IFNAMSIZ],
             ifr_addr: make_sockaddr_in(config.address),
+            _pad: [0; 8],
         };
         set_name(&mut req.ifr_name, ifname);
         if libc::ioctl(sock, SIOCSIFADDR, &req as *const _) < 0 {

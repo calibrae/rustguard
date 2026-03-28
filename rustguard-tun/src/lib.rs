@@ -57,6 +57,10 @@ impl Tun {
     }
 
     /// Raw file descriptor. Needed for io_uring and AF_XDP integration.
+    ///
+    /// # Safety warning
+    /// The returned fd is owned by this `Tun`. The caller must not close it
+    /// or let it outlive this `Tun` instance. Treat it as a borrowed reference.
     pub fn raw_fd(&self) -> i32 {
         self.fd
     }
@@ -98,8 +102,10 @@ impl Tun {
 
 impl Drop for Tun {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
         }
     }
 }

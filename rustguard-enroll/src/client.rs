@@ -215,6 +215,12 @@ fn add_route(cidr: &str, ifname: &str) {
         .args(["route", "add", cidr, "dev", ifname])
         .output();
 
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let result: Result<std::process::Output, io::Error> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("add_route not implemented for this platform"),
+    ));
+
     match result {
         Ok(out) if out.status.success() => println!("route add {cidr} -> {ifname}"),
         Ok(out) => {

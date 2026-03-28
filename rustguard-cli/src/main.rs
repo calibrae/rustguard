@@ -79,14 +79,14 @@ fn cmd_serve(args: &[String]) {
         match args[i].as_str() {
             "--pool" => {
                 i += 1;
-                pool = args.get(i).cloned().filter(|v| !v.is_empty()).or_else(|| {
+                pool = args.get(i).cloned().filter(|v| !v.is_empty() && !v.starts_with("--")).or_else(|| {
                     eprintln!("--pool requires a value");
                     process::exit(1);
                 });
             }
             "--token" => {
                 i += 1;
-                token = args.get(i).cloned().filter(|v| !v.is_empty()).or_else(|| {
+                token = args.get(i).cloned().filter(|v| !v.is_empty() && !v.starts_with("--")).or_else(|| {
                     eprintln!("--token requires a value");
                     process::exit(1);
                 });
@@ -96,7 +96,7 @@ fn cmd_serve(args: &[String]) {
             }
             "--xdp" => {
                 i += 1;
-                xdp_ifname = args.get(i).cloned().filter(|v| !v.is_empty()).or_else(|| {
+                xdp_ifname = args.get(i).cloned().filter(|v| !v.is_empty() && !v.starts_with("--")).or_else(|| {
                     eprintln!("--xdp requires a value");
                     process::exit(1);
                 });
@@ -169,7 +169,7 @@ fn cmd_join(args: &[String]) {
         match args[i].as_str() {
             "--token" => {
                 i += 1;
-                token = args.get(i).cloned().filter(|v| !v.is_empty()).or_else(|| {
+                token = args.get(i).cloned().filter(|v| !v.is_empty() && !v.starts_with("--")).or_else(|| {
                     eprintln!("--token requires a value");
                     process::exit(1);
                 });

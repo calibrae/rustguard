@@ -186,6 +186,16 @@ pub fn process_response(
         return None;
     }
 
+    // ── Verify MAC1 FIRST — cheap check before any DH. ──
+    // MAC1 is keyed with HASH(LABEL_MAC1 || initiator_public), computed over
+    // the response bytes before the mac1 field (first 60 bytes).
+    let our_public = our_static.public_key();
+    let wire = msg.to_bytes();
+    let expected_mac1 = compute_mac1(&our_public, &wire[..60]);
+    if !constant_time_eq(&msg.mac1, &expected_mac1) {
+        return None;
+    }
+
     let resp_eph = PublicKey::from_bytes(msg.ephemeral);
 
     // Mix responder ephemeral into hash.

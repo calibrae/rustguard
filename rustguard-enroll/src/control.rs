@@ -96,7 +96,13 @@ pub fn start_listener(
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            handle_client(stream, &window, &peer_count);
+            // Prevent a stalled client from blocking the listener indefinitely.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let window = Arc::clone(&window);
+            let peer_count = Arc::clone(&peer_count);
+            thread::spawn(move || {
+                handle_client(stream, &window, &peer_count);
+            });
         }
     });
 

@@ -143,6 +143,12 @@ impl Default for XdpConfig {
     }
 }
 
+/// An mmap'd ring region with its base pointer and size for cleanup.
+struct MmapRegion {
+    base: *mut u8,
+    size: usize,
+}
+
 /// An AF_XDP socket with UMEM and ring buffers.
 /// Provides zero-copy packet I/O for the encrypted UDP side.
 pub struct XdpSocket {
@@ -157,6 +163,8 @@ pub struct XdpSocket {
     ring_size: u32,
     /// Free frame indices for TX.
     free_frames: Vec<u64>,
+    /// mmap'd ring regions that must be munmap'd on drop.
+    ring_maps: [MmapRegion; 4],
 }
 
 // Safety: XdpSocket owns its fd and mmap regions.
@@ -212,12 +220,16 @@ impl XdpSocket {
             return Err(err);
         }
 
-        // 4. Set ring sizes.
+        // 4. Set ring sizes — check each return value.
         let rs = config.ring_size as i32;
-        setsockopt_raw(fd, SOL_XDP, XDP_UMEM_FILL_RING, &rs);
-        setsockopt_raw(fd, SOL_XDP, XDP_UMEM_COMPLETION_RING, &rs);
-        setsockopt_raw(fd, SOL_XDP, XDP_RX_RING, &rs);
-        setsockopt_raw(fd, SOL_XDP, XDP_TX_RING, &rs);
+        for &optname in &[XDP_UMEM_FILL_RING, XDP_UMEM_COMPLETION_RING, XDP_RX_RING, XDP_TX_RING] {
+            if setsockopt_raw(fd, SOL_XDP, optname, &rs) < 0 {
+                let err = io::Error::last_os_error();
+                libc::close(fd);
+                libc::munmap(umem as *mut _, umem_size);
+                return Err(err);
+            }
+        }
 
         // 5. Query mmap offsets.
         let mut offsets = XdpMmapOffsets::default();
@@ -243,10 +255,10 @@ impl XdpSocket {
         let comp_map = mmap_ring(fd, &offsets.cr, config.ring_size, XDP_UMEM_PGOFF_COMPLETION_RING, 8)?;
 
         let mask = config.ring_size - 1;
-        let rx_ring = make_ring(rx_map, &offsets.rx, mask);
-        let tx_ring = make_ring(tx_map, &offsets.tx, mask);
-        let fill_ring = make_ring(fill_map, &offsets.fr, mask);
-        let comp_ring = make_ring(comp_map, &offsets.cr, mask);
+        let rx_ring = make_ring(rx_map.base, &offsets.rx, mask);
+        let tx_ring = make_ring(tx_map.base, &offsets.tx, mask);
+        let fill_ring = make_ring(fill_map.base, &offsets.fr, mask);
+        let comp_ring = make_ring(comp_map.base, &offsets.cr, mask);
 
         // 7. Pre-populate fill ring (first half of frames for RX).
         let rx_frames = config.num_frames / 2;
@@ -291,6 +303,7 @@ impl XdpSocket {
             comp_ring,
             ring_size: config.ring_size,
             free_frames,
+            ring_maps: [rx_map, tx_map, fill_map, comp_map],
         })
     }
 
@@ -337,8 +350,13 @@ impl XdpSocket {
         self.fill_ring.set_producer(prod);
     }
 
-    /// Send a packet via the TX ring. Returns false if no frames available.
+    /// Send a packet via the TX ring. Returns false if no frames available
+    /// or data exceeds frame size.
     pub fn tx_send(&mut self, data: &[u8]) -> bool {
+        if data.len() > self.frame_size as usize {
+            return false;
+        }
+
         let Some(frame_addr) = self.free_frames.pop() else {
             return false;
         };
@@ -397,6 +415,12 @@ impl Drop for XdpSocket {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
+            // Unmap ring regions first, then UMEM.
+            for region in &self.ring_maps {
+                if !region.base.is_null() && region.size > 0 {
+                    libc::munmap(region.base as *mut _, region.size);
+                }
+            }
             libc::munmap(self.umem as *mut _, self.umem_size);
         }
     }
@@ -420,7 +444,7 @@ unsafe fn mmap_ring(
     ring_size: u32,
     pgoff: i64,
     desc_size: usize,
-) -> io::Result<*mut u8> {
+) -> io::Result<MmapRegion> {
     let size = off.desc as usize + (ring_size as usize) * desc_size;
     let ptr = libc::mmap(
         std::ptr::null_mut(),
@@ -433,7 +457,10 @@ unsafe fn mmap_ring(
     if ptr == libc::MAP_FAILED {
         return Err(io::Error::last_os_error());
     }
-    Ok(ptr as *mut u8)
+    Ok(MmapRegion {
+        base: ptr as *mut u8,
+        size,
+    })
 }
 
 unsafe fn make_ring(base: *mut u8, off: &XdpRingOffset, mask: u32) -> Ring {

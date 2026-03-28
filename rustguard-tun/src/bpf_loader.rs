@@ -49,19 +49,33 @@ impl XdpProgram {
         let xsks_map_fd = bpf_create_xskmap(64)?;
 
         // 2. Parse ELF, extract program bytecode, patch map references.
-        let insns = parse_and_patch_elf(XDP_WG_OBJ, xsks_map_fd)?;
+        let insns = match parse_and_patch_elf(XDP_WG_OBJ, xsks_map_fd) {
+            Ok(insns) => insns,
+            Err(e) => {
+                unsafe { libc::close(xsks_map_fd) };
+                return Err(e);
+            }
+        };
         eprintln!("  BPF: parsed ELF, {} insn bytes, map_fd={}", insns.len(), xsks_map_fd);
 
         // 3. Load BPF program.
-        let prog_fd = bpf_prog_load(&insns).map_err(|e| {
-            io::Error::new(e.kind(), format!("prog_load ({} insns): {e}", insns.len() / 8))
-        })?;
+        let prog_fd = match bpf_prog_load(&insns) {
+            Ok(fd) => fd,
+            Err(e) => {
+                unsafe { libc::close(xsks_map_fd) };
+                return Err(io::Error::new(e.kind(), format!("prog_load ({} insns): {e}", insns.len() / 8)));
+            }
+        };
         eprintln!("  BPF: program loaded, prog_fd={}", prog_fd);
 
         // 4. Attach to interface.
-        attach_xdp(ifindex, prog_fd).map_err(|e| {
-            io::Error::new(e.kind(), format!("xdp_attach ifindex={ifindex}: {e}"))
-        })?;
+        if let Err(e) = attach_xdp(ifindex, prog_fd) {
+            unsafe {
+                libc::close(prog_fd);
+                libc::close(xsks_map_fd);
+            }
+            return Err(io::Error::new(e.kind(), format!("xdp_attach ifindex={ifindex}: {e}")));
+        }
         eprintln!("  BPF: attached to ifindex={}", ifindex);
 
         Ok(Self {
@@ -320,14 +334,15 @@ fn attach_xdp_netlink(ifindex: u32, prog_fd: i32) -> io::Result<()> {
     // Read ACK.
     let mut resp = [0u8; 128];
     let n = unsafe { libc::recv(sock, resp.as_mut_ptr() as *mut _, resp.len(), 0) };
+    if n < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(sock) };
+        return Err(err);
+    }
     unsafe { libc::close(sock) };
 
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Check for error in nlmsghdr.
-    if n >= 16 {
+    // Check for error in nlmsghdr. Need at least 20 bytes to read resp[16..20].
+    if n >= 20 {
         let nlmsg_type = u16::from_ne_bytes([resp[4], resp[5]]);
         if nlmsg_type == 2 {
             // NLMSG_ERROR

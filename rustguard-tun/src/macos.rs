@@ -65,6 +65,7 @@ struct IfAliasReq {
 struct IfreqMtu {
     ifr_name: [u8; 16],
     ifr_mtu: i32,
+    _pad: [u8; 12], // Darwin ifreq is 32 bytes; name(16) + mtu(4) + pad to 32.
 }
 
 // ── Implementation ──────────────────────────────────────────────────
@@ -208,11 +209,10 @@ fn configure_address(ifname: &str, config: &TunConfig) -> io::Result<()> {
         req.ifra_name[..name_bytes.len()].copy_from_slice(name_bytes);
 
         let ret = libc::ioctl(sock, SIOCAIFADDR, &req as *const _);
-        libc::close(sock);
-
         if ret < 0 {
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
+        libc::close(sock);
         Ok(())
     }
 }
@@ -227,16 +227,16 @@ fn set_mtu(ifname: &str, mtu: u16) -> io::Result<()> {
         let mut req = IfreqMtu {
             ifr_name: [0; 16],
             ifr_mtu: mtu as i32,
+            _pad: [0; 12],
         };
         let name_bytes = ifname.as_bytes();
         req.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
 
         let ret = libc::ioctl(sock, SIOCSIFMTU, &req as *const _);
-        libc::close(sock);
-
         if ret < 0 {
-            return Err(last_os_error());
+            return Err(close_and_error(sock));
         }
+        libc::close(sock);
         Ok(())
     }
 }

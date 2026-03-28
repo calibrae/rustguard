@@ -13,6 +13,7 @@
 #![cfg(target_os = "linux")]
 
 use io_uring::{opcode, types, IoUring};
+use std::cell::UnsafeCell;
 use std::io;
 
 /// Number of buffer slots in the pool.
@@ -25,7 +26,8 @@ const RING_ENTRIES: u32 = 256;
 /// A pre-allocated buffer pool for io_uring fixed buffer I/O.
 pub struct BufferPool {
     /// Contiguous allocation: NUM_BUFS × BUF_SIZE bytes.
-    data: Vec<u8>,
+    /// UnsafeCell because io_uring writes into this buffer while we hold &self references.
+    data: UnsafeCell<Vec<u8>>,
     /// Which slots are currently owned by io_uring (in-flight).
     in_flight: [bool; NUM_BUFS],
 }
@@ -33,7 +35,7 @@ pub struct BufferPool {
 impl BufferPool {
     fn new() -> Self {
         Self {
-            data: vec![0u8; NUM_BUFS * BUF_SIZE],
+            data: UnsafeCell::new(vec![0u8; NUM_BUFS * BUF_SIZE]),
             in_flight: [false; NUM_BUFS],
         }
     }
@@ -41,18 +43,23 @@ impl BufferPool {
     /// Get a mutable reference to buffer slot `idx`.
     pub fn slot_mut(&mut self, idx: usize) -> &mut [u8] {
         let start = idx * BUF_SIZE;
-        &mut self.data[start..start + BUF_SIZE]
+        let data = self.data.get_mut();
+        &mut data[start..start + BUF_SIZE]
     }
 
     /// Get a reference to buffer slot `idx`.
     pub fn slot(&self, idx: usize) -> &[u8] {
         let start = idx * BUF_SIZE;
-        &self.data[start..start + BUF_SIZE]
+        // Safety: no &mut references exist concurrently when reading completed slots.
+        unsafe { &(*self.data.get())[start..start + BUF_SIZE] }
     }
 
     /// Pointer to slot start (for io_uring SQEs).
+    /// Uses UnsafeCell to soundly obtain a *mut u8 from &self.
     fn slot_ptr(&self, idx: usize) -> *mut u8 {
-        unsafe { self.data.as_ptr().add(idx * BUF_SIZE) as *mut u8 }
+        // Safety: UnsafeCell allows interior mutability; the pointer is passed to io_uring
+        // which writes into the buffer asynchronously.
+        unsafe { (*self.data.get()).as_mut_ptr().add(idx * BUF_SIZE) }
     }
 
     /// Allocate a free slot. Returns None if all in-flight.
@@ -72,10 +79,11 @@ impl BufferPool {
     }
 
     /// Build iovecs for io_uring buffer registration.
-    fn iovecs(&self) -> Vec<libc::iovec> {
+    fn iovecs(&mut self) -> Vec<libc::iovec> {
+        let base = self.data.get_mut().as_mut_ptr();
         (0..NUM_BUFS)
             .map(|i| libc::iovec {
-                iov_base: self.slot_ptr(i) as *mut _,
+                iov_base: unsafe { base.add(i * BUF_SIZE) } as *mut _,
                 iov_len: BUF_SIZE,
             })
             .collect()
@@ -191,8 +199,11 @@ impl UringTun {
             let result = cqe.result();
 
             if is_read {
-                self.pending_reads -= 1;
+                self.pending_reads = self.pending_reads.saturating_sub(1);
             }
+
+            // Free completed slot before refilling to avoid starvation.
+            self.bufs.free(buf_idx);
 
             completions.push(Completion {
                 buf_idx,
@@ -223,8 +234,11 @@ impl UringTun {
             let result = cqe.result();
 
             if is_read {
-                self.pending_reads -= 1;
+                self.pending_reads = self.pending_reads.saturating_sub(1);
             }
+
+            // Free completed slot before refilling to avoid starvation.
+            self.bufs.free(buf_idx);
 
             completions.push(Completion {
                 buf_idx,

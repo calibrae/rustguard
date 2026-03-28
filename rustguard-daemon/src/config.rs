@@ -118,6 +118,11 @@ impl Config {
             }
 
             if line.eq_ignore_ascii_case("[Interface]") {
+                // Flush any in-progress peer before switching to interface.
+                if current_section == Some("peer") && !current_peer_kvs.is_empty() {
+                    peers.push(parse_peer(&current_peer_kvs)?);
+                    current_peer_kvs.clear();
+                }
                 current_section = Some("interface");
                 continue;
             }
@@ -192,15 +197,20 @@ fn parse_interface(kvs: &[(&str, &str)]) -> io::Result<InterfaceConfig> {
                 // Support comma-separated v4 and v6: "10.0.0.1/24, fd15::1/64"
                 for part in value.split(',') {
                     let part = part.trim();
-                    let (addr_str, prefix) = part.split_once('/').unwrap_or((part, "24"));
-                    let prefix_len: u8 = prefix.parse().map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("bad prefix: {e}"))
-                    })?;
+                    let (addr_str, prefix_opt) = part.split_once('/').map(|(a, p)| (a, Some(p))).unwrap_or((part, None));
 
                     if let Ok(v4) = addr_str.parse::<Ipv4Addr>() {
+                        let prefix = prefix_opt.unwrap_or("24");
+                        let prefix_len: u8 = prefix.parse().map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, format!("bad prefix: {e}"))
+                        })?;
                         address = Some(v4);
                         netmask = prefix_to_netmask(prefix_len);
                     } else if let Ok(v6) = addr_str.parse::<Ipv6Addr>() {
+                        let prefix = prefix_opt.unwrap_or("64");
+                        let prefix_len: u8 = prefix.parse().map_err(|e| {
+                            io::Error::new(io::ErrorKind::InvalidData, format!("bad prefix: {e}"))
+                        })?;
                         address_v6 = Some((v6, prefix_len));
                     } else {
                         return Err(io::Error::new(
@@ -278,6 +288,13 @@ fn parse_cidr(s: &str) -> io::Result<CidrAddr> {
     let prefix_len = prefix_str_opt.unwrap_or(default_prefix).parse::<u8>().map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidData, format!("bad CIDR prefix: {e}"))
     })?;
+    let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
+    if prefix_len > max_prefix {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("prefix length {prefix_len} exceeds maximum {max_prefix} for address {addr}"),
+        ));
+    }
     Ok(CidrAddr { addr, prefix_len })
 }
 

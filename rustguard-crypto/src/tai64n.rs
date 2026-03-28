@@ -29,7 +29,7 @@ impl Tai64n {
     /// encoding invariant that WireGuard's byte-wise timestamp ordering depends on.
     pub fn from_unix(secs: u64, nanos: u32) -> Self {
         let nanos = nanos.min(999_999_999);
-        let tai_secs = secs + TAI64_EPOCH_OFFSET;
+        let tai_secs = secs.saturating_add(TAI64_EPOCH_OFFSET);
         let mut buf = [0u8; 12];
         buf[..8].copy_from_slice(&tai_secs.to_be_bytes());
         buf[8..].copy_from_slice(&nanos.to_be_bytes());
@@ -41,6 +41,14 @@ impl Tai64n {
     }
 
     pub fn from_bytes(bytes: [u8; 12]) -> Self {
+        // Clamp nanoseconds to 999_999_999 to maintain the invariant that
+        // byte-wise ordering equals temporal ordering.
+        let nanos = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        if nanos > 999_999_999 {
+            let mut clamped = bytes;
+            clamped[8..12].copy_from_slice(&999_999_999u32.to_be_bytes());
+            return Self(clamped);
+        }
         Self(bytes)
     }
 

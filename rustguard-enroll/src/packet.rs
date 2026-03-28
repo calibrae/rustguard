@@ -33,6 +33,9 @@ fn parse_ipv4_udp(ip_data: &[u8]) -> Option<ParsedUdp<'_>> {
     }
 
     let ihl = (ip_data[0] & 0x0f) as usize * 4;
+    if ihl < 20 {
+        return None; // IHL below minimum IPv4 header size.
+    }
     let protocol = ip_data[9];
     if protocol != 17 {
         return None; // Not UDP.

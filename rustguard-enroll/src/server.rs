@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use rustguard_core::handshake;
 use rustguard_core::messages::*;
-use rustguard_crypto::{PublicKey, StaticSecret, AEAD_TAG_LEN};
+use rustguard_crypto::{PublicKey, StaticSecret, Tai64n, AEAD_TAG_LEN};
 use rustguard_tun::{Tun, TunConfig};
 
 use crate::control::{self, EnrollmentWindow};
@@ -34,6 +34,7 @@ struct PeerState {
     endpoint: Option<SocketAddr>,
     session: Option<rustguard_core::session::TransportSession>,
     timers: rustguard_core::timers::SessionTimers,
+    last_handshake_ts: Option<Tai64n>,
 }
 
 struct ServerState {
@@ -167,6 +168,7 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                         endpoint: None,
                         session: None,
                         timers: rustguard_core::timers::SessionTimers::new(),
+                        last_handshake_ts: None,
                     }),
                 }));
             }
@@ -452,6 +454,7 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                             state: Mutex::new(PeerState {
                                 endpoint: Some(src_addr), session: None,
                                 timers: rustguard_core::timers::SessionTimers::new(),
+                                last_handshake_ts: None,
                             }),
                         });
                         let mut peers = state_in.peers.write().unwrap();
@@ -474,10 +477,17 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                     MSG_INITIATION if n >= INITIATION_SIZE => {
                         let msg = Initiation::from_bytes(buf[..INITIATION_SIZE].try_into().unwrap());
                         let result = handshake::process_initiation(&state_in.our_static, &msg, rand_index());
-                        if let Some((pk, _ts, resp, session)) = result {
+                        if let Some((pk, ts, resp, session)) = result {
                             let peers = state_in.peers.read().unwrap();
                             if let Some(peer) = peers.iter().find(|p| p.public_key == pk) {
                                 let mut ps = peer.state.lock().unwrap();
+                                // Reject replayed initiations: timestamp must be strictly newer.
+                                if let Some(ref last_ts) = ps.last_handshake_ts {
+                                    if !ts.is_after(last_ts) {
+                                        continue;
+                                    }
+                                }
+                                ps.last_handshake_ts = Some(ts);
                                 ps.session = Some(session);
                                 ps.endpoint = Some(src_addr);
                                 ps.timers.session_started();
@@ -504,8 +514,11 @@ pub fn run(config: ServeConfig) -> io::Result<()> {
                         let mut ps = peer.state.lock().unwrap();
                         ps.endpoint = Some(src_addr);
                         if let Some(session) = &mut ps.session {
-                            let mut decrypt_buf = [0u8; 2048];
                             let ct = &buf[TRANSPORT_HEADER_SIZE..];
+                            if ct.len() > 65536 {
+                                continue; // Reject absurdly large frames.
+                            }
+                            let mut decrypt_buf = vec![0u8; ct.len()];
                             decrypt_buf[..ct.len()].copy_from_slice(ct);
                             if let Some(pt_len) = session.decrypt_in_place(counter, &mut decrypt_buf, ct.len()) {
                                 ps.timers.packet_received();

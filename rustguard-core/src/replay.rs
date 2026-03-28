@@ -101,17 +101,21 @@ impl ReplayWindow {
         let bit_shift = (shift % 64) as u32;
 
         if word_shift > 0 {
-            // Shift whole words.
-            self.bitmap.copy_within(..BITMAP_LEN - word_shift, word_shift);
+            // Shift whole words toward higher indices (older positions).
+            // copy_within(src, dest_start): copies bitmap[0..LEN-shift] to bitmap[shift..].
+            for i in (word_shift..BITMAP_LEN).rev() {
+                self.bitmap[i] = self.bitmap[i - word_shift];
+            }
             self.bitmap[..word_shift].fill(0);
         }
 
         if bit_shift > 0 {
-            // Shift remaining bits within words, from high to low.
+            // Shift bits left within words, low→high order.
+            // Carry propagates from lower words to higher words (older positions).
             let mut carry = 0u64;
-            for word in self.bitmap.iter_mut().rev() {
-                let new_carry = *word << (64 - bit_shift);
-                *word = (*word >> bit_shift) | carry;
+            for i in 0..BITMAP_LEN {
+                let new_carry = self.bitmap[i] >> (64 - bit_shift);
+                self.bitmap[i] = (self.bitmap[i] << bit_shift) | carry;
                 carry = new_carry;
             }
         }
