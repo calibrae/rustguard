@@ -118,7 +118,7 @@ impl Config {
             }
 
             if line.eq_ignore_ascii_case("[Interface]") {
-                // Flush any in-progress peer before switching to interface.
+                // Flush previous peer if any (handles [Peer] followed by [Interface]).
                 if current_section == Some("peer") && !current_peer_kvs.is_empty() {
                     peers.push(parse_peer(&current_peer_kvs)?);
                     current_peer_kvs.clear();
@@ -197,20 +197,25 @@ fn parse_interface(kvs: &[(&str, &str)]) -> io::Result<InterfaceConfig> {
                 // Support comma-separated v4 and v6: "10.0.0.1/24, fd15::1/64"
                 for part in value.split(',') {
                     let part = part.trim();
-                    let (addr_str, prefix_opt) = part.split_once('/').map(|(a, p)| (a, Some(p))).unwrap_or((part, None));
+                    // Determine default prefix based on address type.
+                    // We need to peek at the address to decide: v4 defaults to /24, v6 to /64.
+                    let (addr_str, prefix) = match part.split_once('/') {
+                        Some((a, p)) => (a, p.to_string()),
+                        None => {
+                            // Guess the default from whether it contains ':' (IPv6) or not.
+                            let default = if part.contains(':') { "64" } else { "24" };
+                            (part, default.to_string())
+                        }
+                    };
+                    let prefix = prefix.as_str();
+                    let prefix_len: u8 = prefix.parse().map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bad prefix: {e}"))
+                    })?;
 
                     if let Ok(v4) = addr_str.parse::<Ipv4Addr>() {
-                        let prefix = prefix_opt.unwrap_or("24");
-                        let prefix_len: u8 = prefix.parse().map_err(|e| {
-                            io::Error::new(io::ErrorKind::InvalidData, format!("bad prefix: {e}"))
-                        })?;
                         address = Some(v4);
                         netmask = prefix_to_netmask(prefix_len);
                     } else if let Ok(v6) = addr_str.parse::<Ipv6Addr>() {
-                        let prefix = prefix_opt.unwrap_or("64");
-                        let prefix_len: u8 = prefix.parse().map_err(|e| {
-                            io::Error::new(io::ErrorKind::InvalidData, format!("bad prefix: {e}"))
-                        })?;
                         address_v6 = Some((v6, prefix_len));
                     } else {
                         return Err(io::Error::new(
@@ -292,7 +297,7 @@ fn parse_cidr(s: &str) -> io::Result<CidrAddr> {
     if prefix_len > max_prefix {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("prefix length {prefix_len} exceeds maximum {max_prefix} for address {addr}"),
+            format!("CIDR prefix /{prefix_len} too large for {addr} (max /{max_prefix})"),
         ));
     }
     Ok(CidrAddr { addr, prefix_len })
@@ -399,6 +404,263 @@ AllowedIPs = 10.0.0.3/32
             prefix_len: 8,
         };
         assert!(!cidr.contains_v6("fd00::1".parse().unwrap()));
+    }
+
+    // Helper keys for tests -- any valid 32-byte base64 will do.
+    const TEST_PRIVKEY: &str = "cGiPH7CqyNOCaW6ykZLH9K3Bt0enk5rDiTcv1O3A+JA=";
+    const TEST_PUBKEY1: &str = "HhMN8JntZEa8iF6bc+BdJD8MGD9shwefov5Gt+95Ky8=";
+    const TEST_PUBKEY2: &str = "tNwlJsp4WIaPpeCYNsleoE8QzJFVBLHYEHLgHVQ4NyQ=";
+    const TEST_PUBKEY3: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn empty_config() {
+        // Empty string has no [Interface], so parse_interface gets empty kvs
+        // and will error on missing PrivateKey. Should not panic.
+        let result = Config::parse("");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing PrivateKey") || err.contains("missing Address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn interface_only() {
+        let config = Config::parse(&format!(
+            "[Interface]\nPrivateKey = {TEST_PRIVKEY}\nAddress = 10.0.0.1/24\n"
+        ))
+        .unwrap();
+        assert_eq!(config.peers.len(), 0);
+        assert_eq!(config.interface.address, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn multiple_peers() {
+        let input = format!(
+            "\
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.2/32
+
+[Peer]
+PublicKey = {TEST_PUBKEY2}
+AllowedIPs = 10.0.0.3/32
+
+[Peer]
+PublicKey = {TEST_PUBKEY3}
+AllowedIPs = 10.0.0.4/32
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(config.peers.len(), 3, "all three peers must be parsed");
+        // Verify keys are distinct and in order.
+        assert_ne!(config.peers[0].public_key, config.peers[1].public_key);
+        assert_ne!(config.peers[1].public_key, config.peers[2].public_key);
+    }
+
+    #[test]
+    fn peer_before_interface() {
+        // [Peer] before [Interface] -- keys land in "peer" section which is fine,
+        // but the interface comes after. This should parse successfully.
+        let input = format!(
+            "\
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.2/32
+
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.interface.address, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn duplicate_interface_does_not_eat_peer() {
+        // Two [Interface] sections with a peer in between.
+        // The second [Interface] must flush the pending peer, not drop it.
+        let input = format!(
+            "\
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.2/32
+
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY2}
+AllowedIPs = 10.0.0.3/32
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(
+            config.peers.len(),
+            2,
+            "duplicate [Interface] must not swallow the peer before it"
+        );
+    }
+
+    #[test]
+    fn ipv6_address_default_prefix() {
+        // Address = 10.0.0.1/24, fd00::1 -- v6 part has no /prefix, should default to /64.
+        let input = format!(
+            "[Interface]\nPrivateKey = {TEST_PRIVKEY}\nAddress = 10.0.0.1/24, fd00::1\n"
+        );
+        let config = Config::parse(&input).unwrap();
+        let (addr, prefix) = config.interface.address_v6.expect("should have v6 address");
+        assert_eq!(addr, "fd00::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(prefix, 64, "IPv6 without explicit prefix should default to /64");
+    }
+
+    #[test]
+    fn ipv4_address_default_prefix() {
+        // Address = 10.0.0.1 with no /prefix should default to /24 for v4.
+        let input = format!(
+            "[Interface]\nPrivateKey = {TEST_PRIVKEY}\nAddress = 10.0.0.1\n"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(config.interface.address, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(
+            config.interface.netmask,
+            Ipv4Addr::new(255, 255, 255, 0),
+            "IPv4 without explicit prefix should default to /24"
+        );
+    }
+
+    #[test]
+    fn invalid_cidr_prefix() {
+        // 10.0.0.0/64 -- prefix 64 is too large for IPv4 (max 32).
+        let input = format!(
+            "\
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.0/64
+"
+        );
+        let result = Config::parse(&input);
+        assert!(result.is_err(), "v4 with /64 prefix must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("too large"), "error should mention prefix too large: {err}");
+    }
+
+    #[test]
+    fn allowed_ips_multiple() {
+        let input = format!(
+            "\
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.0/24, 192.168.1.0/24, fd00::/64
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        let allowed = &config.peers[0].allowed_ips;
+        assert_eq!(allowed.len(), 3);
+        assert_eq!(allowed[0].addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert_eq!(allowed[0].prefix_len, 24);
+        assert_eq!(allowed[1].addr, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)));
+        assert_eq!(allowed[1].prefix_len, 24);
+        assert!(allowed[2].addr.is_ipv6());
+        assert_eq!(allowed[2].prefix_len, 64);
+    }
+
+    #[test]
+    fn blank_lines_and_comments() {
+        let input = format!(
+            "\
+# This is a comment
+   # Indented comment
+
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+# Another comment
+Address = 10.0.0.1/24
+
+
+[Peer]
+# Peer comment
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.2/32
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.interface.address, Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn missing_private_key() {
+        let input = "[Interface]\nAddress = 10.0.0.1/24\n";
+        let result = Config::parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing PrivateKey"),
+            "should report missing PrivateKey: {err}"
+        );
+    }
+
+    #[test]
+    fn endpoint_ipv4() {
+        let input = format!(
+            "\
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.2/32
+Endpoint = 203.0.113.1:51820
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(
+            config.peers[0].endpoint,
+            Some("203.0.113.1:51820".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn endpoint_ipv6() {
+        let input = format!(
+            "\
+[Interface]
+PrivateKey = {TEST_PRIVKEY}
+Address = 10.0.0.1/24
+
+[Peer]
+PublicKey = {TEST_PUBKEY1}
+AllowedIPs = 10.0.0.2/32
+Endpoint = [2001:db8::1]:51820
+"
+        );
+        let config = Config::parse(&input).unwrap();
+        assert_eq!(
+            config.peers[0].endpoint,
+            Some("[2001:db8::1]:51820".parse().unwrap())
+        );
     }
 
     #[test]

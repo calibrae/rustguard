@@ -101,21 +101,18 @@ impl ReplayWindow {
         let bit_shift = (shift % 64) as u32;
 
         if word_shift > 0 {
-            // Shift whole words toward higher indices (older positions).
-            // copy_within(src, dest_start): copies bitmap[0..LEN-shift] to bitmap[shift..].
-            for i in (word_shift..BITMAP_LEN).rev() {
-                self.bitmap[i] = self.bitmap[i - word_shift];
-            }
+            // Shift whole words.
+            self.bitmap.copy_within(..BITMAP_LEN - word_shift, word_shift);
             self.bitmap[..word_shift].fill(0);
         }
 
         if bit_shift > 0 {
-            // Shift bits left within words, low→high order.
-            // Carry propagates from lower words to higher words (older positions).
+            // Shift remaining bits within words, from low index to high.
+            // Bits move toward higher positions (older ages).
             let mut carry = 0u64;
-            for i in 0..BITMAP_LEN {
-                let new_carry = self.bitmap[i] >> (64 - bit_shift);
-                self.bitmap[i] = (self.bitmap[i] << bit_shift) | carry;
+            for word in self.bitmap.iter_mut() {
+                let new_carry = *word >> (64 - bit_shift);
+                *word = (*word << bit_shift) | carry;
                 carry = new_carry;
             }
         }
@@ -205,5 +202,138 @@ mod tests {
         for i in (0..=start).rev() {
             assert!(w.check_and_update(i), "counter {i} should be accepted");
         }
+    }
+
+    // --- Edge case tests that would have caught the inverted shift bug ---
+
+    #[test]
+    fn replay_after_shift() {
+        // This is the test that catches inverted bit-shift direction.
+        // Mark counter N, advance past it by a small amount, replay N.
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_update(10));
+        // Advance window by receiving a higher counter.
+        assert!(w.check_and_update(15));
+        // Counter 10 is still within the window (age=5) but was already seen.
+        assert!(
+            !w.check_and_update(10),
+            "counter 10 was seen before the shift, must still be rejected after shift"
+        );
+    }
+
+    #[test]
+    fn shift_preserves_seen_bits() {
+        // Mark counters spread across multiple bitmap words, then shift
+        // by a small amount and verify they're still marked.
+        let mut w = ReplayWindow::new();
+        let seen = [0u64, 50, 100, 200, 500, 1000, 1500];
+        // First set the high-water mark so all fit in the window.
+        assert!(w.check_and_update(1500));
+        for &c in &seen[..seen.len() - 1] {
+            assert!(w.check_and_update(c), "counter {c} should be accepted");
+        }
+        // Advance by 10 — everything with age < WINDOW_SIZE should survive.
+        assert!(w.check_and_update(1510));
+        for &c in &seen {
+            let age = 1510 - c;
+            if age < WINDOW_SIZE {
+                assert!(
+                    !w.check_and_update(c),
+                    "counter {c} (age {age}) was seen and still in window, must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shift_by_one() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_update(0));
+        assert!(w.check_and_update(1));
+        // Counter 0 is age=1, well within window, must still be rejected.
+        assert!(
+            !w.check_and_update(0),
+            "counter 0 must be rejected after shift-by-one"
+        );
+    }
+
+    #[test]
+    fn shift_across_word_boundary() {
+        // Bitmap words are 64 bits wide. Mark counters near the boundary
+        // between word 0 and word 1, then shift so bits must carry across.
+        let mut w = ReplayWindow::new();
+        // Start at counter 100 so we have room.
+        assert!(w.check_and_update(100));
+        // Mark counters at ages 63, 64, 65 from current top (counters 37, 36, 35).
+        assert!(w.check_and_update(37));
+        assert!(w.check_and_update(36));
+        assert!(w.check_and_update(35));
+        // Now advance by 3, shifting bits across the word boundary.
+        assert!(w.check_and_update(103));
+        // Counters 37, 36, 35 now have ages 66, 67, 68 — still in window.
+        assert!(
+            !w.check_and_update(37),
+            "counter 37 must survive shift across word boundary"
+        );
+        assert!(
+            !w.check_and_update(36),
+            "counter 36 must survive shift across word boundary"
+        );
+        assert!(
+            !w.check_and_update(35),
+            "counter 35 must survive shift across word boundary"
+        );
+    }
+
+    #[test]
+    fn counter_zero() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_update(0), "counter 0 must be accepted on first use");
+        assert!(
+            !w.check_and_update(0),
+            "counter 0 must be rejected on replay"
+        );
+    }
+
+    #[test]
+    fn shift_by_exact_window_size() {
+        let mut w = ReplayWindow::new();
+        // Seed a bunch of counters.
+        for i in 0..100 {
+            assert!(w.check_and_update(i));
+        }
+        // Advance by exactly WINDOW_SIZE — every previous counter is now too old.
+        let new_top = 99 + WINDOW_SIZE;
+        assert!(w.check_and_update(new_top));
+        for i in 0..100 {
+            assert!(
+                !w.check_and_update(i),
+                "counter {i} must be too old after shifting by exact window size"
+            );
+        }
+    }
+
+    #[test]
+    fn near_u64_max() {
+        // Verify no overflow panics near u64::MAX.
+        let mut w = ReplayWindow::new();
+        let base = u64::MAX - WINDOW_SIZE - 10;
+        assert!(w.check_and_update(base));
+        assert!(w.check_and_update(base + 1));
+        assert!(w.check_and_update(base + WINDOW_SIZE));
+        // base is now at age = WINDOW_SIZE, so it's just outside the window.
+        assert!(
+            !w.check_and_update(base),
+            "counter at exact window edge must be rejected"
+        );
+        // base + 1 is at age = WINDOW_SIZE - 1, still in window but seen.
+        assert!(
+            !w.check_and_update(base + 1),
+            "counter near u64::MAX must still be tracked correctly"
+        );
+        // A counter past the current top near u64::MAX should still work.
+        assert!(w.check_and_update(u64::MAX - 1));
+        assert!(w.check_and_update(u64::MAX));
+        assert!(!w.check_and_update(u64::MAX), "u64::MAX duplicate must be rejected");
     }
 }
